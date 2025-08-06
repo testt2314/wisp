@@ -21,7 +21,7 @@ import json
 
 # 1. File & Folder Paths
 VIDEO_SOURCE_PATH = '/Volumes/Macintosh HD/Downloads/Video/uc'
-AUDIO_SOURCE_PATH = '/Volumes/Macintosh HD/Downloads/Audio'  # For direct audio input
+AUDIO_SOURCE_PATH = '/Volumes/Macintosh HD/Downloads'  # For direct audio input
 SRT_OUTPUT_PATH = '/Volumes/Macintosh HD/Downloads/srt'
 MODEL_STORAGE_PATH = '/Volumes/Macintosh HD/Downloads/srt/whisper_models'
 TEMP_PATH = '/Volumes/Macintosh HD/Downloads/srt/temp'
@@ -92,38 +92,23 @@ TO_LANGUAGE_CODE = {
 }
 
 # =================================================================
-# --- Device Detection and Optimization Functions ---
+# --- System Optimization and Environment Setup ---
 # =================================================================
 
-def detect_optimal_device_and_compute():
+def fix_openmp_conflicts():
     """
-    Detect the best available device and compute type for Apple Silicon M4.
-    Returns tuple of (device, compute_type)
+    Fix OpenMP library conflicts that can cause crashes.
     """
-    print("🔍 Detecting optimal device configuration...")
+    # Set environment variable to allow duplicate OpenMP libraries
+    # This is a workaround for the common OpenMP conflict issue
+    os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
+    os.environ['OMP_NUM_THREADS'] = '1'  # Limit OpenMP threads to prevent conflicts
 
-    # Check for MPS (Apple Silicon) support
-    if torch.backends.mps.is_available():
-        print("✅ Apple Silicon MPS detected and available!")
+    # Additional MKL optimizations for Intel processors
+    os.environ['MKL_NUM_THREADS'] = '1'
+    os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
-        # Set MPS memory optimization
-        if hasattr(torch.mps, 'set_per_process_memory_fraction'):
-            torch.mps.set_per_process_memory_fraction(0.8)  # Use 80% of unified memory
-
-        # Optimize MPS settings
-        os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = str(MPS_HIGH_WATERMARK_RATIO)
-
-        return "mps", "float16"
-
-    # Check for CUDA (unlikely on Mac but just in case)
-    elif torch.cuda.is_available():
-        print("✅ CUDA detected!")
-        return "cuda", "float16"
-
-    # Fallback to optimized CPU
-    else:
-        print("⚠️ Using CPU - consider upgrading to Apple Silicon for better performance")
-        return "cpu", "int8"
+    print("🔧 OpenMP conflict fixes applied")
 
 def setup_offline_environment():
     """
@@ -231,26 +216,109 @@ def download_and_cache_model(model_size):
     except Exception as e:
         print(f"❌ Failed to download model: {e}")
         return False
+
+def detect_optimal_device_and_compute():
+    """
+    Detect the best available device and compute type for Apple Silicon M4.
+    Returns tuple of (device, compute_type)
+    """
+    print("🔍 Detecting optimal device configuration...")
+
+    # Fix OpenMP conflicts before device detection
+    fix_openmp_conflicts()
+
+    # Check system architecture first
+    import platform
+    system_info = platform.platform()
+    print(f"📱 System: {system_info}")
+
+    # Check for Apple Silicon specifically
+    is_apple_silicon = platform.processor() == 'arm' or 'arm64' in platform.machine().lower()
+
+    if is_apple_silicon:
+        print("🍎 Apple Silicon detected!")
+
+        # Check for MPS availability with better error handling
+        try:
+            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
+                print("✅ MPS backend is available and built")
+
+                # Test MPS functionality
+                try:
+                    test_tensor = torch.tensor([1.0]).to('mps')
+                    del test_tensor
+                    torch.mps.empty_cache()
+                    print("✅ MPS functionality test passed")
+
+                    # Set MPS memory optimization
+                    if hasattr(torch.mps, 'set_per_process_memory_fraction'):
+                        torch.mps.set_per_process_memory_fraction(0.8)
+
+                    os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = str(MPS_HIGH_WATERMARK_RATIO)
+                    return "mps", "float16"
+
+                except Exception as mps_error:
+                    print(f"⚠️ MPS test failed: {mps_error}")
+                    print("🔄 Falling back to optimized CPU")
+
+            else:
+                print("⚠️ MPS backend not available or not built")
+
+        except Exception as e:
+            print(f"⚠️ MPS detection error: {e}")
+
+    # Check for CUDA (unlikely on Mac but just in case)
+    elif torch.cuda.is_available():
+        print("✅ CUDA detected!")
+        return "cuda", "float16"
+
+    # Fallback to optimized CPU with better compute type for Apple Silicon
+    print("🔧 Using CPU with optimizations")
+    if is_apple_silicon:
+        return "cpu", "float32"  # Better for Apple Silicon
+    else:
+        return "cpu", "int8"
+
+def optimize_for_apple_silicon():
     """Apply Apple Silicon specific optimizations."""
-    if torch.backends.mps.is_available():
+    import platform
+
+    # Fix OpenMP conflicts first
+    fix_openmp_conflicts()
+
+    is_apple_silicon = platform.processor() == 'arm' or 'arm64' in platform.machine().lower()
+
+    if is_apple_silicon:
         print("🚀 Applying Apple Silicon optimizations...")
 
         # Set optimal thread count for Apple Silicon
         if CPU_THREADS == 0:
-            # M4 typically has 10 cores (4P + 6E), optimize for this
-            optimal_threads = min(torch.get_num_threads(), 8)  # Use up to 8 threads
+            # M4 typically has 10 cores (4P + 6E), but limit for stability
+            optimal_threads = min(torch.get_num_threads(), 4)  # Conservative threading
             torch.set_num_threads(optimal_threads)
             print(f"📊 Using {optimal_threads} CPU threads")
         else:
             torch.set_num_threads(CPU_THREADS)
 
-        # Enable MPS fallback for unsupported operations
-        os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
+        # Enable MPS fallback for unsupported operations only if MPS is available
+        if torch.backends.mps.is_available():
+            os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
 
-        # Optimize memory management
-        torch.mps.empty_cache()  # Clear any existing MPS cache
+            # Clear any existing MPS cache
+            try:
+                torch.mps.empty_cache()
+            except:
+                pass  # Ignore if MPS cache operations fail
 
         print("✅ Apple Silicon optimizations applied")
+    else:
+        print("🔧 Applying Intel/x86 optimizations...")
+        # Conservative settings for Intel processors
+        if CPU_THREADS == 0:
+            optimal_threads = min(torch.get_num_threads(), 4)
+            torch.set_num_threads(optimal_threads)
+            print(f"📊 Using {optimal_threads} CPU threads")
+        print("✅ Intel optimizations applied")
 
 def setup_model_with_fallback(model_size, device, compute_type):
     """
@@ -258,6 +326,9 @@ def setup_model_with_fallback(model_size, device, compute_type):
     """
     print(f"📦 Loading Whisper model '{model_size}' from cache...")
     print(f"🎯 Target device: {device}, compute_type: {compute_type}")
+
+    # Apply additional fixes for stability
+    fix_openmp_conflicts()
 
     # First, try with the detected optimal settings and local files only
     try:
@@ -267,7 +338,7 @@ def setup_model_with_fallback(model_size, device, compute_type):
             compute_type=compute_type,
             download_root=MODEL_STORAGE_PATH,
             local_files_only=LOCAL_FILES_ONLY,  # Force local files only
-            num_workers=NUM_WORKERS
+            num_workers=1  # Force single worker to prevent multiprocessing issues
         )
         print(f"✅ Model loaded successfully on {device} with {compute_type} (offline)")
         return model, device, compute_type
@@ -276,7 +347,7 @@ def setup_model_with_fallback(model_size, device, compute_type):
         print(f"⚠️ Failed to load from cache on {device}: {e}")
 
         # If offline mode is disabled and model not found, try to download
-        if not FORCE_OFFLINE_MODE and "No such file or directory" in str(e):
+        if not FORCE_OFFLINE_MODE and ("No such file or directory" in str(e) or "not found" in str(e).lower()):
             print("📥 Attempting to download model for first-time setup...")
             if download_and_cache_model(model_size):
                 # Try again after download
@@ -287,18 +358,18 @@ def setup_model_with_fallback(model_size, device, compute_type):
                         compute_type=compute_type,
                         download_root=MODEL_STORAGE_PATH,
                         local_files_only=True,  # Now use cached version
-                        num_workers=NUM_WORKERS
+                        num_workers=1
                     )
                     print(f"✅ Model loaded after download on {device} with {compute_type}")
                     return model, device, compute_type
                 except Exception as download_error:
                     print(f"❌ Still failed after download: {download_error}")
 
-        # Try fallback combinations with local files only
+        # Try fallback combinations with more conservative settings
         fallback_configs = [
-            ("cpu", "int8"),
-            ("cpu", "float32"),
-            ("auto", "auto")
+            ("cpu", "float32"),  # Better for Apple Silicon
+            ("cpu", "int8"),     # Most compatible
+            ("auto", "auto")     # Let the library decide
         ]
 
         for fallback_device, fallback_compute in fallback_configs:
@@ -310,7 +381,7 @@ def setup_model_with_fallback(model_size, device, compute_type):
                     compute_type=fallback_compute,
                     download_root=MODEL_STORAGE_PATH,
                     local_files_only=LOCAL_FILES_ONLY,
-                    num_workers=NUM_WORKERS
+                    num_workers=1  # Single worker for stability
                 )
                 print(f"✅ Model loaded on fallback: {fallback_device} with {fallback_compute} (offline)")
                 return model, fallback_device, fallback_compute
@@ -324,10 +395,6 @@ def setup_model_with_fallback(model_size, device, compute_type):
         if LOCAL_FILES_ONLY:
             error_msg += "Try downloading the model first by setting FORCE_OFFLINE_MODE = False"
         raise Exception(error_msg)
-
-# =================================================================
-# --- Helper Functions (Enhanced for Performance) ---
-# =================================================================
 
 # =================================================================
 # --- Language Support and Validation ---
@@ -700,7 +767,7 @@ def run_transcription_and_cleaning(input_filename):
 
         start_time = time.time()
 
-        # Enhanced transcription parameters for better quality
+        # Enhanced transcription parameters for better quality and stability
         segments, info = model.transcribe(
             audio=audio_for_transcription,
             task=TASK,
@@ -779,15 +846,30 @@ def run_transcription_and_cleaning(input_filename):
         traceback.print_exc()
 
     finally:
-        # 8. Cleanup
-        if torch.backends.mps.is_available():
-            torch.mps.empty_cache()  # Clear MPS memory
+        # 8. Cleanup with better error handling
+        try:
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()  # Clear MPS memory
+        except:
+            pass  # Ignore cleanup errors
+
+        try:
+            if 'model' in locals():
+                del model  # Explicitly delete model to free memory
+        except:
+            pass
 
         if os.path.exists(TEMP_PATH):
-            print(f"\n🧹 Cleaning up temporary folder: {TEMP_PATH}")
-            shutil.rmtree(TEMP_PATH)
+            try:
+                print(f"\n🧹 Cleaning up temporary folder: {TEMP_PATH}")
+                shutil.rmtree(TEMP_PATH)
+            except:
+                print("⚠️ Could not clean up temp folder (may be in use)")
 
 if __name__ == "__main__":
+    # Apply early fixes
+    fix_openmp_conflicts()
+
     # Display system info
     print("🍎 Apple Silicon MPS-Optimized Whisper Transcription")
     print("=" * 60)
