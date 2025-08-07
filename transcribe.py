@@ -36,7 +36,7 @@ TASK = "translate"                  # "transcribe" or "translate"
 MODEL_SIZE = "large-v3"
 # OPTIMIZED: Auto-detect best device with MPS support
 DEVICE = "auto"  # Will auto-detect MPS, CUDA, or CPU
-COMPUTE_TYPE = "auto"  # Will auto-select best compute type for device
+COMPUTE_TYPE = "mps" #"auto"  # Will auto-select best compute type for device
 CREDIT = "Subbed by Gemini"
 
 # Model caching configuration
