@@ -1,0 +1,976 @@
+==================================
+1 . setup and installation
+==================================
+#@markdown **Setup and Installation**
+#@markdown *Takes roughly two minutes*
+
+import sys, os
+from IPython.utils import io
+from IPython.display import clear_output
+import contextlib
+
+print('Installing necessary libraries.\n *** This will take a couple of minutes *** \n')
+
+# Construct the log file path using audio_folder
+log_file_path = os.path.join(audio_folder, "install_log.txt")
+
+# Open the file in append mode ('a')
+with open(log_file_path, 'a') as f:
+    # If the file is not empty, truncate it
+    if os.stat(log_file_path).st_size != 0:
+        f.truncate(0)
+@contextlib.contextmanager
+def suppress_stdout():
+    with open(os.devnull, "w") as devnull:
+        old_stdout = sys.stdout
+        sys.stdout = devnull
+        try:
+            yield
+        finally:
+            sys.stdout = old_stdout
+
+# Installation commands (output suppressed)
+with suppress_stdout():
+
+  !apt-get update && apt-get install -y --no-install-recommends \
+      libcudnn8 \
+      libcudnn8-dev
+  !sudo apt-get install sox libsox-fmt-mp3 libsndfile1
+  !add-apt-repository -y ppa:savoury1/ffmpeg4
+  !apt-get -qq install -y ffmpeg
+  #!ffmpeg -version
+  %pip install -q ffmpeg-python srt deepl
+  %pip install pysrt
+  %pip install nagisa
+  %pip install faster-whisper==1.1.1
+  %pip install ctranslate2==4.5.0
+  %pip install torch==1.12.1
+  %pip install hf_xet
+
+
+print(' *** Installation Done! *** \n')
+
+==================================
+2 . Global Parameters and Definitions
+==================================
+from dynet_viz import new_builder_num
+#@markdown **Global Parameters and Definitions**
+
+
+
+TQDM_FORMAT = "{desc}: {percentage:3.1f}% |{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate:.2f} audio s / real time s]"
+
+PUNCT_MATCH = ["。", "、", ",", ".", "〜", "！", "!", "？", "?", "-"]
+REMOVE_QUOTES = dict.fromkeys(map(ord, '"„“‟”＂「」'), None)
+GARBAGE_LIST2 = [
+  "Her daughter is crying loudly.",
+  "Her daughter is crying loudly",
+  "Dog: “Good night, grandma.",
+  ]
+
+NEED_CONTEXT_LINES = [
+	"feelsgod",
+	"godbye",
+	"godnight",
+	"thankyou",
+]
+
+clean_text = lambda text: (text
+	.replace(".", "")
+	.replace(",", "")
+	.lower()
+	.replace("that feels", "feels")
+	.replace("oo", "o")
+)
+
+TO_LANGUAGE_CODE = { # from https://github.com/openai/whisper/blob/main/whisper/tokenizer.py
+	"afrikaans": "af",
+	"chinese": "zh",
+	"english": "en",
+	"japanese": "ja",
+	"korean": "ko"
+}
+
+
+suppress_low = [
+    "お前が寝たい",
+    "えが",
+    "プー",
+]
+
+suppress_high = [
+    "subscribe",
+    "この動画の字幕は視聴者によって作成されました。",
+    "この動画の字幕は視聴者によって作成されました",
+]
+
+garbage_list = [
+    "hm",
+    "hmm",
+    "huh",
+    "oh",
+]
+
+need_context_lines = [
+    "feelsgod",
+    "godbye",
+    "godnight",
+    "thankyou",
+]
+
+
+
+# Define a generator function to generate all audio files with no srt in a directory
+def audio_files_generator(directory_path):
+    audio_files = []
+    for file_name in os.listdir(directory_path):
+        if file_name.endswith((".mp3", ".wav", ".aac", ".m4a", ".ogg", ".opus", ".flac")):
+            # Check if corresponding .srt file exists
+            base_name = os.path.splitext(file_name)[0]  # Get the base name of the file (without extension)
+            srt_file = base_name + ".srt"  # Corresponding .srt file name
+            if not os.path.exists(os.path.join(directory_path, srt_file)):  # If .srt file does not exist
+                audio_files.append(os.path.join(directory_path, file_name))
+    # Sort the files in alphabetical order
+    audio_files.sort()
+    for file_name in audio_files:
+        yield file_name
+
+
+
+# Usage:
+# clean_srt_file('path_to_your_srt_file', 'path_to_target_directory', ['list_of_hallucination_words_1', 'list_of_hallucination_words_2', 'list_of_hallucination_words_3'])
+def clean_srt_file(source_file, target_dir, hallucination_lists):
+    # Load the SRT file
+    subs = pysrt.open(source_file, encoding='utf-8')
+
+    # Use hallucination words from provided lists
+    hallucination_words = [word for sublist in hallucination_lists for word in sublist]
+
+    i = 0
+    while i < len(subs):
+        # Merge consecutive identical lines
+        if i < len(subs) - 1 and subs[i].text == subs[i+1].text and (subs[i+1].start - subs[i].end).seconds < 0.4:
+            subs[i].end = subs[i+1].end
+            del subs[i+1]
+            continue
+
+
+        # This pattern will match any phrase (sequence of words between commas) that is repeated at least 2 times
+        text= subs[i].text
+        pattern = r"((?:[^,]*,)\s*)(\1{1,})"
+        while re.search(pattern, text):
+            text = re.sub(pattern, r"\1", text)
+            subs[i].text = text
+
+        # Remove repeated words in a line
+        words = subs[i].text.split()
+        j = 0
+        while j < len(words) - 2:
+            if words[j] == words[j+1] == words[j+2]:
+                del words[j]
+            else:
+                j += 1
+        subs[i].text = ' '.join(words)
+
+        # Remove hallucination words or sentences
+        for word in hallucination_words:
+            word_regex = r'(?<=\s)' + re.escape(word) + r'(?=\s)'
+            subs[i].text = re.sub(word_regex, '', ' ' + subs[i].text + ' ').strip()
+
+        # Adjust duration of long subtitle lines
+        if (subs[i].end - subs[i].start).seconds > 6:
+            num_chars = len(subs[i].text)
+            new_duration = num_chars / 15.0  # assuming 15 characters per second
+
+            start_time = datetime.datetime.combine(datetime.date.today(), subs[i].start.to_time())
+            new_end_time = start_time + datetime.timedelta(seconds=new_duration)
+
+            subs[i].end.hours = new_end_time.hour
+            subs[i].end.minutes = new_end_time.minute
+            subs[i].end.seconds = new_end_time.second
+            subs[i].end.milliseconds = new_end_time.microsecond // 1000
+
+        i += 1
+
+    # Remove empty subtitle lines and renumber the SRT file
+    subs_cleaned = [s for s in subs if s.text.strip() != '']
+    for i, sub in enumerate(subs_cleaned):
+        sub.index = i + 1
+
+    # Check if target directory exists, if not create it
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+
+    # Save cleaned SRT file to target directory
+    base_name = os.path.basename(source_file)
+    new_name = os.path.splitext(base_name)[0] + '.srt'
+    target_file = os.path.join(target_dir, new_name)
+
+    with open(target_file, 'w', encoding='utf-8') as f:
+        for sub in subs_cleaned:
+            f.write(str(sub))
+            f.write('\n\n')
+
+
+
+def clean_srt_file_english(source_file, target_dir, hallucination_lists):
+    # Load the SRT file
+    subs = list(srt.parse(open(source_file, 'r', encoding='utf-8').read()))
+
+    # Define the commentary patterns to remove
+    patterns = [r'\(.*?\)', r'\[.*?\]', r'★.*?★']
+
+    # Remove any subtitles whose content matches any of the commentary patterns
+    subs = [sub for sub in subs if not any(re.search(pattern, sub.content) for pattern in patterns)]
+
+    # Flatten hallucination lists into a single list
+    hallucination_sentences = [sentence for sublist in hallucination_lists for sentence in sublist]
+
+    # Remove any subtitles whose content matches a hallucination sentence
+    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in map(lambda s: re.sub(r'\W+', '', s).strip(), hallucination_sentences)]
+
+    # Remove empty subtitles
+    subs = [sub for sub in subs if sub.content.strip() != '']
+
+    # Sort and renumber the SRT file
+    subs.sort(key=lambda sub: sub.start)
+    for i, sub in enumerate(subs):
+        sub.index = i + 1
+
+    i = 0
+    while i < len(subs):
+        # Merge consecutive identical lines
+        if i < len(subs) - 1 and subs[i].content == subs[i+1].content:
+            subs[i].start = subs[i+1].start
+            del subs[i+1]
+            continue
+
+        text = subs[i].content
+
+        # Remove repetition within same text in each sub
+        pattern = r"(\b[\w']+\b)([\s,]*\1)+"
+        #pattern = r"(\b\w+\b)([\s,]*\1)+"
+        #pattern = r"(\b\w+\b)(\s*\1)+"
+        while re.search(pattern, text):
+            text = re.sub(pattern, r"\1", text)
+
+        # If a sub has had repetition then adjust its duration
+        if text != subs[i].content:
+            duration = len(text) * 0.015 * 1000 #miliseconds
+            subs[i].end = subs[i].start + timedelta(milliseconds=duration)
+            #text = "[REPETITION ADJUSTMENT]: " + text
+
+        # If a sub has too long text, set the duration to 500 milliseconds and prepend the text "[HALLU]: " to the text
+        if len(text) > 200: # arbitrary threshold, adjust as needed
+            text = ""
+            subs[i].start = subs[i].end - timedelta(milliseconds=100)
+
+        # If a sub has too long duration, adjust the duration
+        if (subs[i].end - subs[i].start).seconds > 6: # arbitrary threshold, adjust as needed
+            subs[i].start = subs[i].end - timedelta(seconds=len(text) / 15)
+            #subs[i].start = subs[i].end - timedelta(seconds=10)
+            #text = "[DURATION ADJUSTMENT]: " + text
+
+        # If a sub's duration does not fit within the range of slow speech and fast speech, adjust the duration
+
+
+        duration_seconds = (subs[i].end - subs[i].start).total_seconds()
+
+        # Add a small value to duration to prevent division by zero
+        duration_seconds = duration_seconds if duration_seconds > 0 else 0.001
+
+        chars_per_second = len(text) / duration_seconds
+        if chars_per_second < 7: # slower than slow speech
+            subs[i].start = subs[i].end - timedelta(seconds=len(text) / 15)
+            #text = "[SLOW SPEECH ADJUSTMENT]: " + text
+        elif chars_per_second > 33: # faster than fast speech
+            #subs[i].start = subs[i].end - timedelta(seconds=len(text) / 15)
+            #text = "[FAST SPEECH ADJUSTMENT]: " + text
+            print("possible halucination skiped")
+
+        subs[i].content = text
+
+        i += 1
+
+    # Check if target directory exists, if not create it
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+
+    # Save cleaned SRT file to target directory
+    base_name = os.path.basename(source_file)
+    new_name = os.path.splitext(base_name)[0] + '.srt'
+    target_file = os.path.join(target_dir, new_name)
+
+    with open(target_file, 'w', encoding='utf-8') as f:
+        f.write(srt.compose(subs))
+
+    return target_file
+
+
+
+
+
+def clean_srt_english_revg(source_file, target_dir, hallucination_lists):
+    # Load the SRT file
+    with open(source_file, 'r', encoding='utf-8') as f:
+        subs = list(srt.parse(f.read()))
+
+    # Flatten hallucination lists into a single list
+    hallucination_sentences = [sentence for sublist in hallucination_lists for sentence in sublist]
+
+    # Remove any subtitles whose content matches a hallucination sentence
+    subs = [sub for sub in subs if sub.content.strip() not in map(str.strip, hallucination_sentences)]
+
+    # Remove repeated lines
+    new_subs = [subs[0]]
+    for i in range(1, len(subs)):
+        if subs[i].content != subs[i-1].content or (subs[i].start - subs[i-1].end).total_seconds() >= 0.25:
+            new_subs.append(subs[i])
+    subs = new_subs
+
+    # Remove repeated words within the same subtitle line and adjust duration if content has changed
+    for sub in subs:
+        words = sub.content.split()
+        new_words = []
+        for word in words:
+            if new_words[-3:] != [word, word, word]:
+                new_words.append(word)
+        new_content = " ".join(new_words)
+
+        if new_content != sub.content:
+            sub.content = new_content
+            num_chars = len(sub.content)
+            new_duration = num_chars / 15.0  # assuming 15 characters per second
+
+            # Adjust the end time based on the new duration
+            sub.end = sub.start + datetime.timedelta(seconds=new_duration)
+
+    # Check for long subtitle lines and remove repetitions
+    for sub in subs:
+
+        # Remove lines that start with "★"
+        if sub.content.startswith('★'):
+            sub.content = ''
+        else:
+            # Check for long lines
+
+            if len(sub.content) > 120:
+                pattern = r'\b(\w+\s+)\1{2,}\b'
+                sub.content = re.sub(pattern, r'\1', sub.content)
+
+                #this line needs modification. Check if the content is changed.
+                # Recalculate the duration
+                num_chars = len(sub.content)
+                new_duration = num_chars / 15.0  # assuming 15 characters per second
+
+                # Adjust the end time based on the new duration
+                sub.end = sub.start + datetime.timedelta(seconds=new_duration)
+
+            # If subtitle duration is longer than 5 seconds and total number of characters is less than 30
+            if (sub.end - sub.start).total_seconds() > 5 and len(sub.content) < 30:
+                # Recalculate the duration
+                new_duration = len(sub.content) / 10.0  # assuming 10 characters per second
+
+                # Adjust the start time to keep the end time fixed
+                sub.start = sub.end - datetime.timedelta(seconds=new_duration)
+
+            # If subtitle duration is longer than 10 seconds check again
+            #if (sub.end - sub.start).total_seconds() > 10:
+
+
+    # Remove lines that contain the pattern 【 any text here 】
+    pattern = r'【.*?】'
+    subs = [sub for sub in subs if not re.search(pattern, sub.content)]
+
+
+
+    # Remove empty lines
+    subs = [sub for sub in subs if sub.content.strip()]
+
+    # Sort the subtitles by start time
+    subs.sort(key=lambda sub: sub.start)
+
+    # Renumber the subtitles
+    for i, sub in enumerate(subs):
+        sub.index = i + 1
+
+    # Check if target directory exists, if not create it
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+
+    # Save cleaned SRT file to target directory
+    base_name = os.path.basename(source_file)
+    new_name = os.path.splitext(base_name)[0] + '.srt'
+    target_file = os.path.join(target_dir, new_name)
+
+    # Write the processed subtitles back to the file
+    with open(target_file, "w", encoding="utf-8") as f:
+        f.write(srt.compose(subs))
+
+#    with open(target_file, 'w', encoding='utf-8') as f:
+#        for sub in subs_cleaned:
+#            f.write(str(sub))
+#            f.write('\n\n')
+
+
+
+
+# Usage:
+# clean_srt_file('path_to_your_srt_file', 'path_to_target_directory', ['list_of_hallucination_words_1', 'list_of_hallucination_words_2', 'list_of_hallucination_words_3'])
+
+def clean_srt_file_japanese(source_file, target_dir, hallucination_lists):
+    # Load the SRT file
+    subs = list(srt.parse(open(source_file, 'r', encoding='utf-8').read()))
+
+    i = 0
+    while i < len(subs):
+        # Merge consecutive identical lines
+        if i < len(subs) - 1 and subs[i].content == subs[i+1].content and (subs[i+1].start - subs[i].end).seconds < 0.4:
+            subs[i].end = subs[i+1].end
+            del subs[i+1]
+            continue
+
+        text = subs[i].content
+
+        # Split the text into phrases
+        phrases = text.split('、')
+
+        # Initialize an empty list to hold the non-repeating phrases
+        non_repeating_phrases = []
+
+        # Initialize a flag to track if there are any repetitions
+        has_repetitions = False
+
+        # Iterate over the phrases
+        for j in range(len(phrases)):
+            # If the phrase is not the same as the previous phrase, add it to the list
+            if j == 0 or phrases[j].strip() != phrases[j-1].strip():
+                non_repeating_phrases.append(phrases[j])
+            else:
+                # If there is a repetition, set the flag to True
+                has_repetitions = True
+
+        # Join the non-repeating phrases back into a single string
+        text_without_repetitions = '、'.join(non_repeating_phrases)
+
+        # If there were any repetitions, mark the line as a potential hallucination
+        # and change the duration to 100 milliseconds
+        if has_repetitions:
+            #text_without_repetitions += " --hallucination?"
+            subs[i].end = subs[i].start + timedelta(milliseconds=100)
+
+        pattern = r"([^\s]+)(\s*\1){3,}"
+        while re.search(pattern, text_without_repetitions):
+            text_without_repetitions = re.sub(pattern, r"\1", text_without_repetitions)
+
+        if text_without_repetitions != subs[i].content:
+            # Calculate new start time if line was changed
+            duration = len(text_without_repetitions) * 0.040 * 1000 #miliseconds
+
+            start_time = subs[i].start
+            end_time = start_time + timedelta(milliseconds=duration)
+
+            new_sub = srt.Subtitle(i+1, start_time, end_time, text_without_repetitions)
+
+            subs[i] = new_sub
+
+        i += 1
+
+    # Define the patterns to remove
+    patterns = [r'★.*?★', r'「.*?」', r'【.*?】', '^「', '^★']
+
+    # Remove any subtitles whose content matches any of the patterns
+    subs = [sub for sub in subs if not any(re.search(pattern, sub.content) for pattern in patterns)]
+
+    # Flatten hallucination lists into a single list
+    hallucination_sentences = [sentence for sublist in hallucination_lists for sentence in sublist]
+
+    # Remove any subtitles whose content matches a hallucination sentence
+    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in map(lambda s: re.sub(r'\W+', '', s).strip(), hallucination_sentences)]
+
+
+
+    # Remove empty subtitle lines and renumber the SRT file
+    subs_cleaned = [s for s in subs if s.content.strip() != '']
+    for i, sub in enumerate(subs_cleaned):
+        sub.index = i + 1
+
+    # Check if target directory exists, if not create it
+    if not os.path.exists(target_dir):
+        os.makedirs(target_dir)
+
+    # Save cleaned SRT file to target directory
+    base_name = os.path.basename(source_file)
+    new_name = os.path.splitext(base_name)[0] + '.srt'
+    target_file = os.path.join(target_dir, new_name)
+
+    with open(target_file, 'w', encoding='utf-8') as f:
+        f.write(srt.compose(subs_cleaned))
+
+    return target_file
+
+
+# Usage:
+# clean_srt_file_japanese('path_to_your_srt_file', 'path_to_target_directory')
+
+
+
+def punctuateText(inputtext, modelPath):
+    if not isinstance(inputtext, str):
+        print("Error: Input text is not a valid string.")
+        return inputtext  # Return the input text unchanged or handle the error appropriately
+    print("\n === inputtext is: ", inputtext)
+
+
+    # Rest of your code
+
+    base_name = "model_to_add_punctuation"
+
+    tagger = nagisa.Tagger(
+        vocabs=f"{base_name}.vocabs",
+        params=f"{base_name}.params",
+        hp=f"{base_name}.hp",
+    )
+
+    tokens = tagger.tagging(inputtext)
+
+    words = tokens.words
+    tags = tokens.postags
+
+    outputs = []
+    for word, tag in zip(words, tags):
+        outputs.append(word)
+        if tag == "1":
+            outputs.append("、")
+        elif tag == "2":
+            outputs.append("。")
+
+    # 突然ですがこれは日本語句読点付与プログラムです試してみてください
+    # print(inputtext)
+
+    # 突然ですが、これは日本語句読点付与プログラムです。試してみてください。
+    print("".join(outputs))
+    return "".join(outputs)
+
+
+
+def sanitiseHallucinationEN(segs, modelPath):
+  return segs
+
+
+
+
+
+def sanitiseHallucinationJA(segs, modelPath):
+
+
+    tseg = copy.deepcopy(segs)
+    print("\n === tseg text is: ", tseg.text)
+    tseg.text = tseg.text + "test"
+
+
+    # Remove repetition
+    newtext = tseg.text
+    pattern = r"([^\s]+)(\s*\1){3,}"
+    while re.search(pattern, newtext):
+        newtext = re.sub(pattern, r"\1", newtext)
+
+    if segs.text != newtext:
+        # The text was changed
+        duration = len(tseg.text) * 0.040
+        segs.end = tseg.start + duration
+        tseg.text = newtext
+        tseg.text += ' 。 (cut)。'
+
+    # punctuate the text
+    tseg.text = punctuateText(tseg.text, modelPath)
+
+
+
+    # if no_speech_prob then append possible Hallu
+    if segs.no_speech_prob > 0.8:
+        tseg.text += ' 。(hallu)。'
+
+    return tseg
+
+
+def testsanitiseHallucinationJA(segs, modelPath):
+
+    print("sanitiseHallucinationJA function has been called")  # New print statement
+    print(f"segs: {segs}")  # This will print the value of 'segs'
+
+    print(type(segs))  # This will print the type of 'segs'
+    if isinstance(segs, dict):  # This checks if 'segs' is a dictionary
+        print(segs.keys())  # If 'segs' is a dictionary, this will print its keys
+
+    if isinstance(segs, dict) and 'segments' in segs:
+        for i, segment in enumerate(segs['segments']):
+            print(f"Segment {i}: {type(segment)}")
+            if isinstance(segment, dict):
+                print(f"Keys in segment {i}: {segment.keys()}")
+    return segs
+
+
+
+def stamp_srt_file(file_path, marker_text):
+    with open(file_path, 'r', encoding='utf-8') as file:
+        subs = list(srt.parse(file.read()))
+
+    # Insert the first subtitle with marker_text
+    if marker_text:
+        first_sub = srt.Subtitle(index=1,
+                                 start=timedelta(0),
+                                 end=timedelta(milliseconds=600),
+                                 content=marker_text)
+        subs.insert(0, first_sub)
+
+        # Reindex the subtitles after inserting the first one
+        for i, sub in enumerate(subs, start=1):
+            sub.index = i
+
+    # Add a new subtitle at the end with marker_text
+    if subs:
+        last_sub_end_time = subs[-1].end
+        new_start_time = last_sub_end_time
+        new_end_time = last_sub_end_time + timedelta(milliseconds=600)
+        last_sub_text = f"{marker_text} [created using whisperjav 0.7]"
+        last_sub = srt.Subtitle(index=len(subs) + 1,
+                                start=new_start_time,
+                                end=new_end_time,
+                                content=last_sub_text)
+        subs.append(last_sub)
+
+    # Generate the SRT string and write it to the file
+    with open(file_path, 'w', encoding='utf-8') as file:
+        file.write(srt.compose(subs))
+
+
+
+
+# Main code where the magic happens
+def run_whisper_wrapper(
+    model_size = "large",
+    audio_path = "/content/drive/MyDrive/WhisperJAV",
+    language = "japanese",
+    task = "translate",
+    vad_threshold = 0.4,
+    chunk_duration = 15.0,
+    new_vocabulary = "",
+    deepl_flag = False,
+    deepl_target_lang = "EN-US",
+    deepl_authkey = "",
+    condition_on_previous_text = False
+    ):
+
+    # some sanity checks
+    assert vad_threshold >= 0.01
+    assert chunk_duration >= 0.1
+    assert audio_path != ""
+    assert language != ""
+    language = language.lower()
+    assert language in TO_LANGUAGE_CODE, "invalid language"
+
+
+    if new_vocabulary.strip() == "":
+      new_vocabulary = None
+
+    #print(str(deepl_flag))
+
+
+
+    # Get the base file name without extension
+    audiofilebasename = os.path.basename(os.path.splitext(audio_path)[0])
+    subfolder = ".subs.original"
+
+    # Get the directory of the audio file
+    audiofile_dir = os.path.dirname(audio_path)
+
+    # Construct the subfolder path
+    subfolder_path = os.path.join(audiofile_dir, subfolder)
+
+    # Create the subfolder if it doesn't exist
+    os.makedirs(subfolder_path, exist_ok=True)
+
+    if (task=="translate"):
+      out_path = os.path.join(subfolder_path, audiofilebasename + ".en" + ".srt")
+      out_path_pre = os.path.join(subfolder_path, audiofilebasename + ".en" + ".original.srt")
+    else:
+      out_path = os.path.join(subfolder_path, audiofilebasename + ".ja" + ".srt")
+      out_path_pre = os.path.join(subfolder_path, audiofilebasename + ".ja" + ".original.srt")
+
+
+    print("Running Whisper … PLEASE WAIT")
+    segments, info = WHISPER_MODEL.transcribe(
+      audio_path,
+      task=task,
+      language=TO_LANGUAGE_CODE[language],
+      condition_on_previous_text=condition_on_previous_text,
+      initial_prompt=new_vocabulary,
+      word_timestamps=True,
+      #temperature=0,   # Slightly increase temperature for flexibility
+      #beam_size=2, # Increase beam size for better search
+      #best_of=2, # Consider more hypotheses for accuracy
+      #patience=2, # Increase patience to allow the model to explore more possibilities
+      temperature=0.1,
+      beam_size=5,
+      best_of=5,
+      patience=3,
+      vad_filter=True,
+      #repetition_penalty= 1.5, # Lower repetition penalty
+      #no_repeat_ngram_size= 2, # Adjust for better context flow
+      repetition_penalty= 1.2,
+      no_repeat_ngram_size= 1,
+      vad_parameters=dict(threshold=vad_threshold, max_speech_duration_s=chunk_duration),
+    )
+
+
+    PROTOFLAG = False
+    absfolderpath = os.path.dirname(os.path.abspath(audio_path))
+
+    subs = []
+    segment_info = []
+    timestamps = 0.0  # for progress bar
+
+    #with tqdm(total=info.duration, bar_format=TQDM_FORMAT) as pbar:
+    with tqdm(total=info.duration) as pbar:
+      for i, seg in enumerate(segments, start=1):
+        # Keep segment info for debugging
+        segment_info.append(seg)
+
+        if PROTOFLAG == True :
+
+            # make a deep copy of each entry
+            temp_seg = copy.deepcopy(seg)
+
+            # Clean up possible hallucination
+            if (task == "transcribe"):
+                temp_seg = sanitiseHallucinationJA(temp_seg, absfolderpath)
+            elif (task == "translate"):
+                temp_seg = sanitiseHallucinationEN(temp_seg, absfolderpath)
+            else:
+                print("\n ==== sanitisation funtion NOT performed! ==== \n")
+
+
+        # Add to SRT list
+        subs.append(srt.Subtitle(
+          index=i,
+          start=datetime.timedelta(seconds=seg.start),
+          end=datetime.timedelta(seconds=seg.end),
+          content=seg.text.strip(),
+        ))
+        pbar.update(seg.end - timestamps)
+        timestamps = seg.end
+      if timestamps < info.duration:
+        pbar.update(info.duration - timestamps)
+
+    #for debugging only
+    #with open("segment_info.debug.json", mode="w", encoding="utf8") as f:
+    #  json.dump(segment_info, f, indent=4)
+
+    # DeepL translation
+    translate_error = False
+    if deepl_flag:
+      print("Translating with DeepL …")
+      with open(out_path_pre, "w", encoding="utf8") as f:
+        f.write(srt.compose(subs))
+      print("(Japanese original subs saved to", out_path_pre, ")")
+
+      lines = []
+      for i in range(len(subs)):
+        if language == "japanese":
+          if subs[i].content[-1] not in PUNCT_MATCH:
+            subs[i].content += "。"
+          subs[i].content = "「" + subs[i].content + "」"
+        else:
+          if subs[i].content[-1] not in PUNCT_MATCH:
+            subs[i].content += "."
+          subs[i].content = '"' + subs[i].content + '"'
+      for i in range(len(subs)):
+        lines.append(subs[i].content)
+
+      grouped_lines = []
+      english_lines = []
+      for i, l in enumerate(lines):
+        if i % 30 == 0:
+          # Split lines into smaller groups, to prevent error 413
+          grouped_lines.append([])
+          if i != 0:
+            # Include previous 3 lines, to preserve context between splits
+            grouped_lines[-1].extend(grouped_lines[-2][-3:])
+        grouped_lines[-1].append(l.strip())
+
+      try:
+        translator = deepl.Translator(deepl_authkey)
+        for i, n in enumerate(tqdm(grouped_lines)):
+          x = ["\n".join(n).strip()]
+          if language == "japanese":
+            result = translator.translate_text(x, source_lang="JA", target_lang=deepl_target_lang)
+          else:
+            result = translator.translate_text(x, target_lang=deepl_target_lang)
+          english_tl = result[0].text.strip().splitlines()
+          assert len(english_tl) == len(n), f"Invalid translation line count ({len(english_tl)} vs {len(n)})"
+          if i != 0:
+            english_tl = english_tl[3:]
+          for e in english_tl:
+            english_lines.append(
+              e.strip().translate(REMOVE_QUOTES).replace("’", "'")
+            )
+        for i, e in enumerate(english_lines):
+          subs[i].content = e
+      except Exception as e:
+        print("DeepL translation error:", e)
+        print("(downloading untranslated version instead)")
+        translate_error = True
+
+    # Write SRT file
+    if translate_error:
+      g_files.download(out_path_pre)
+    else:
+      # Removal of garbage lines
+      clean_subs = []
+      last_line_garbage = False
+      for i in range(len(subs)):
+        c = clean_text(subs[i].content)
+        is_garbage = True
+        for w in c.split(" "):
+          w_tmp = w.strip()
+          if w_tmp == "":
+            continue
+          if w_tmp in GARBAGE_LIST2:
+            continue
+          elif w_tmp in NEED_CONTEXT_LINES and last_line_garbage:
+            continue
+          else:
+            is_garbage = False
+            break
+        if not is_garbage:
+          clean_subs.append(subs[i])
+        last_line_garbage = is_garbage
+      with open(out_path, mode="w", encoding="utf8") as f:
+        f.write(srt.compose(clean_subs))
+      print("\nDone! Subs being written to", out_path)
+
+
+
+      prohibited_phrases_arg = [GARBAGE_LIST2, suppress_high, garbage_list]
+
+      if (task == "translate") :
+        final_srt = clean_srt_file_english(out_path, ".", prohibited_phrases_arg)
+        stamp_srt_file(final_srt, CREDIT)
+
+      elif (task == "transcribe") and (deepl_flag):
+        clean_srt_file_english(out_path_pre, ".", prohibited_phrases_arg)
+        final_srt = clean_srt_file_japanese(out_path, ".", prohibited_phrases_arg)
+        stamp_srt_file(final_srt, CREDIT)
+
+      elif (task == "transcribe") and (not deepl_flag):
+        final_srt = clean_srt_file_japanese(out_path, ".", prohibited_phrases_arg)
+        stamp_srt_file(final_srt, CREDIT)
+
+      else:
+	      raise ValueError("Oops Something has gone wrong. Missing modes")
+
+
+
+      #print("Downloading SRT file:")
+      #g_files.download(out_path)
+      print("\nSRT file is being saved in your Google Drive folder. \nPlease download SRTs manually when finished. \n Sometimes you need to refresh your folder to see the new SRTs.\n")
+
+==================================
+3 . Runs Whisper on all audio files in the given folder
+==================================
+#@markdown **Runs Whisper on all audio files in the given folder**
+
+#@markdown You can select among options from pulldown menus below:
+
+#@markdown ========================================
+
+
+
+import torch, torchaudio, os, srt, datetime, json ,faster_whisper
+from tqdm import tqdm
+import pysrt
+import re
+from datetime import timedelta
+from google.colab import files as g_files, drive as g_drive
+import nagisa
+import copy
+import deepl
+
+
+
+select_model = "large-v3"  # @param ["tiny","base","small","medium", "large-v1", "large-v2", "large-v3"]
+translation_mode = "English translation"  # @param ["Japanese transcription", "English translation", "Japanese + English with DeepL"]
+vad_threshold = 0.15  # @param {type:"number"}
+chunk_duration = 5  # @param {type:"number"}
+#@markdown If you've selected DeepL then give your auth key:
+deepl_authkey = ""  # @param {type:"string"}
+
+#@markdown ========================================
+
+#@markdown If you want to add a credit or signature line to the srt file: e.g. Produced by AZER
+CREDIT = ""  # @param {type:"string"}
+
+
+# Inputs sanity checks
+assert vad_threshold >= 0.01
+assert chunk_duration >= 0.1
+
+
+#DEFAULTS
+audio_language = "japanese"
+task = "transcribe"
+initial_prompt = ""
+previous_text = False
+run_deepl = False
+deepl_target_lang = "EN-US"
+
+
+audio_files_list = list(audio_files_generator(audio_folder))
+WHISPER_MODEL = faster_whisper.WhisperModel(select_model, device="cuda")
+
+
+if translation_mode == "English translation":
+    task = "translate"
+    run_deepl = False
+elif translation_mode == "Japanese + English with DeepL":
+    task = "transcribe"
+    run_deepl = True
+    if deepl_authkey == "" :
+        raise ValueError("You have selected DeepL but DeepL Auth Key is missing. Please input DeepL Auth Key and Run all again")
+elif translation_mode == "Japanese transcription":
+  	task = "transcribe"
+  	run_deepl = False
+else:
+	raise ValueError("Invalid translation mode")
+
+
+
+
+# use the %cd magic command to change the directory to audio_dir
+os.chdir(audio_folder)
+%cd $audio_folder
+!pwd
+#!ls -la
+
+# Call the process_audio_file function for each audio file in the list
+for audio_file in audio_files_list:
+    print("\nProcessing file: ")
+    print(audio_file)
+    run_whisper_wrapper(
+        select_model,
+        audio_file,
+        audio_language,
+        task,
+        vad_threshold,
+        chunk_duration,
+        initial_prompt,
+        run_deepl,
+        deepl_target_lang,
+        deepl_authkey,
+        previous_text
+    )
+
+
+print("all done!")
+print("You can download the SRTs from your Google Drive one by one, or execute next cell to doanload them all in a zip file")
