@@ -14,6 +14,8 @@ import pysrt
 from tqdm import tqdm
 import torch
 import json
+import threading
+from queue import Queue
 
 # =================================================================
 # --- ⚙️ Global Parameters (Configure Everything Here) ---
@@ -26,6 +28,11 @@ SRT_OUTPUT_PATH = '/Volumes/Macintosh HD/Downloads/srt'
 MODEL_STORAGE_PATH = '/Volumes/Macintosh HD/Downloads/srt/whisper_models'
 TEMP_PATH = '/Volumes/Macintosh HD/Downloads/srt/temp'
 AUDIO_OUTPUT_PATH = '/Volumes/Macintosh HD/Downloads/srt/audio_cache'  # Permanent audio storage
+
+# FFmpeg Configuration (Audacity installation)
+FFMPEG_PATH = '/Volumes/250SSD/Library/Application Support/audacity/libs'
+FFMPEG_BINARY = os.path.join(FFMPEG_PATH, 'ffmpeg')
+FFPROBE_BINARY = os.path.join(FFMPEG_PATH, 'ffprobe')
 
 # 2. Language & Task Settings
 SOURCE_LANGUAGE = "ja"              # Source language (ISO code: ja for Japanese)
@@ -90,6 +97,276 @@ TO_LANGUAGE_CODE = {
     "ms": "ms-MY",      # Malay
     "uk": "uk-UA",      # Ukrainian
 }
+
+# =================================================================
+# --- Progress Bar Implementation for Transcription ---
+# =================================================================
+
+class TranscriptionProgressTracker:
+    """
+    Advanced progress tracking for Whisper transcription with Apple Silicon optimization.
+    Uses threading to monitor transcription progress without interfering with MPS.
+    """
+
+    def __init__(self, audio_duration=None):
+        self.audio_duration = audio_duration
+        self.progress_bar = None
+        self.segments_processed = 0
+        self.current_time = 0.0
+        self.total_segments = 0
+        self.is_active = False
+        self.segment_queue = Queue()
+        self.last_update_time = time.time()
+
+    def start(self, description="🎤 Transcribing"):
+        """Initialize and start the progress bar."""
+        self.is_active = True
+        self.last_update_time = time.time()
+
+        if self.audio_duration and self.audio_duration > 0:
+            # Time-based progress bar (more accurate)
+            self.progress_bar = tqdm(
+                total=self.audio_duration,
+                desc=description,
+                unit="sec",
+                bar_format="{l_bar}{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}] {rate_fmt}",
+                dynamic_ncols=True,
+                smoothing=0.1  # Smooth the ETA calculation
+            )
+        else:
+            # Segment-based progress bar (fallback) - set total to avoid None issue
+            self.progress_bar = tqdm(
+                total=1000,  # Set a reasonable default total for segments
+                desc=description,
+                unit="seg",
+                bar_format="{l_bar}{bar}| {n} segments [{elapsed}] {rate_fmt}",
+                dynamic_ncols=True
+            )
+
+    def update_segment(self, segment):
+        """Update progress based on processed segment."""
+        if not self.is_active:
+            return
+
+        # Safe check for progress_bar existence
+        if self.progress_bar is None:
+            return
+
+        try:
+            self.segments_processed += 1
+            current_time = time.time()
+
+            # Update based on segment timing
+            if hasattr(segment, 'end'):
+                self.current_time = segment.end
+
+                if self.audio_duration and self.audio_duration > 0:
+                    # Update time-based progress
+                    progress = min(self.current_time, self.audio_duration)
+                    self.progress_bar.n = progress
+                else:
+                    # Update segment-based progress
+                    self.progress_bar.n = self.segments_processed
+                    # Extend total if we exceed the initial estimate
+                    if self.segments_processed >= self.progress_bar.total:
+                        self.progress_bar.total = self.segments_processed + 100
+
+                # Add processing rate info
+                if current_time - self.last_update_time > 0.5:  # Update every 0.5 seconds
+                    self.progress_bar.set_postfix({
+                        'segments': self.segments_processed,
+                        'current': f"{self.current_time:.1f}s"
+                    })
+                    self.progress_bar.refresh()
+                    self.last_update_time = current_time
+
+        except Exception as e:
+            # Silently handle any progress update errors to avoid disrupting transcription
+            pass
+
+    def finish(self):
+        """Complete the progress bar."""
+        if self.progress_bar is not None:
+            try:
+                if self.audio_duration and self.audio_duration > 0:
+                    self.progress_bar.n = self.audio_duration
+                else:
+                    self.progress_bar.n = self.segments_processed
+
+                self.progress_bar.set_postfix({
+                    'segments': self.segments_processed,
+                    'status': 'Complete'
+                })
+                self.progress_bar.close()
+            except Exception:
+                # Ignore any errors during cleanup
+                pass
+            finally:
+                self.progress_bar = None
+
+        self.is_active = False
+
+def setup_ffmpeg_environment():
+    """
+    Setup FFmpeg environment using Audacity's installation.
+    """
+    global FFMPEG_BINARY, FFPROBE_BINARY
+
+    print("🔧 Setting up FFmpeg from Audacity installation...")
+
+    # Check if Audacity's FFmpeg binaries exist
+    if os.path.exists(FFMPEG_BINARY) and os.path.exists(FFPROBE_BINARY):
+        print(f"✅ Found FFmpeg at: {FFMPEG_BINARY}")
+        print(f"✅ Found FFprobe at: {FFPROBE_BINARY}")
+
+        # Make sure binaries are executable
+        try:
+            os.chmod(FFMPEG_BINARY, 0o755)
+            os.chmod(FFPROBE_BINARY, 0o755)
+        except OSError:
+            pass  # Ignore permission errors
+
+        return True
+    else:
+        print(f"❌ FFmpeg not found at: {FFMPEG_PATH}")
+        print("💡 Please check if Audacity is properly installed")
+
+        # Try to find FFmpeg in common locations
+        common_paths = [
+            '/usr/local/bin/ffmpeg',
+            '/opt/homebrew/bin/ffmpeg',
+            '/usr/bin/ffmpeg'
+        ]
+
+        for path in common_paths:
+            if os.path.exists(path):
+                print(f"🔍 Found alternative FFmpeg at: {path}")
+                FFMPEG_BINARY = path
+                FFPROBE_BINARY = path.replace('ffmpeg', 'ffprobe')
+                if os.path.exists(FFPROBE_BINARY):
+                    print(f"✅ Using system FFmpeg installation")
+                    return True
+
+        print("⚠️ No FFmpeg found - some features will be limited")
+        return False
+
+def check_ffmpeg_availability():
+    """
+    Check if ffmpeg and ffprobe are available using our configured paths.
+    """
+    ffmpeg_available = os.path.exists(FFMPEG_BINARY)
+    ffprobe_available = os.path.exists(FFPROBE_BINARY)
+
+    return ffmpeg_available, ffprobe_available
+
+def get_audio_duration_fast(audio_path):
+    """
+    Get audio duration using ffprobe with fallback methods.
+    Returns None if no method works, allowing progress bar to work without duration.
+    """
+    # Check if ffprobe is available
+    if not os.path.exists(FFPROBE_BINARY):
+        print("ℹ️ ffprobe not found - using segment-based progress tracking")
+        return None
+
+    try:
+        # Primary method: JSON output
+        cmd = [
+            FFPROBE_BINARY, '-v', 'quiet', '-print_format', 'json',
+            '-show_format', '-select_streams', 'a:0', audio_path
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
+
+        if result.returncode == 0:
+            data = json.loads(result.stdout)
+            duration = float(data['format']['duration'])
+            print(f"⏱️ Audio duration detected: {duration:.2f} seconds")
+            return duration
+        else:
+            # Fallback method: CSV output
+            cmd_simple = [FFPROBE_BINARY, '-v', 'quiet', '-show_entries',
+                         'format=duration', '-of', 'csv=p=0', audio_path]
+            result = subprocess.run(cmd_simple, capture_output=True, text=True, timeout=15)
+            if result.returncode == 0 and result.stdout.strip():
+                duration = float(result.stdout.strip())
+                print(f"⏱️ Audio duration detected (fallback): {duration:.2f} seconds")
+                return duration
+
+    except FileNotFoundError:
+        print("ℹ️ ffprobe not accessible - install FFmpeg or check Audacity installation")
+        return None
+    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
+            json.JSONDecodeError, ValueError, KeyError) as e:
+        print(f"⚠️ Could not determine audio duration with ffprobe: {e}")
+
+    # Try alternative method using file size estimation (very rough)
+    try:
+        file_size = os.path.getsize(audio_path)
+        # Very rough estimate: assume ~128kbps average bitrate for MP3
+        # This is just a fallback and won't be very accurate
+        estimated_duration = (file_size * 8) / (128 * 1000)  # rough estimate in seconds
+        if estimated_duration > 0:
+            print(f"📊 Using rough file-size based duration estimate: {estimated_duration:.1f} seconds")
+            return estimated_duration
+    except Exception:
+        pass
+
+    print("ℹ️ No audio duration available - using segment-based progress tracking")
+    return None
+
+def transcribe_with_progress(model, audio_path, progress_tracker, **transcribe_kwargs):
+    """
+    Enhanced transcription function with real-time progress tracking.
+    Optimized for Apple Silicon M4 and MPS acceleration.
+    """
+    print(f"\n🎬 Starting transcription with progress tracking...")
+    print(f"🔧 Audio: {os.path.basename(audio_path)}")
+
+    try:
+        # Get audio duration for better progress estimation
+        audio_duration = get_audio_duration_fast(audio_path)
+        if audio_duration:
+            print(f"⏱️ Audio duration: {audio_duration:.2f} seconds")
+            progress_tracker.audio_duration = audio_duration
+
+        # Start progress tracking
+        progress_tracker.start("🎤 Transcribing")
+
+        # Run transcription with enhanced parameters for M4 Mac Mini
+        segments, info = model.transcribe(
+            audio=audio_path,
+            **transcribe_kwargs
+        )
+
+        # Process segments with progress updates
+        segment_list = []
+
+        for segment in segments:
+            segment_list.append(segment)
+            progress_tracker.update_segment(segment)
+
+            # Yield control periodically to prevent blocking on MPS
+            if len(segment_list) % 10 == 0:
+                time.sleep(0.001)  # Tiny sleep to prevent MPS overload
+
+        # Complete progress tracking
+        progress_tracker.finish()
+
+        print(f"✅ Transcription completed!")
+        print(f"📊 Processed {len(segment_list)} segments")
+        print(f"🌐 Detected language: {info.language} (confidence: {info.language_probability:.3f})")
+
+        return segment_list, info
+
+    except Exception as e:
+        # Safe cleanup of progress bar
+        if progress_tracker and hasattr(progress_tracker, 'progress_bar') and progress_tracker.progress_bar is not None:
+            try:
+                progress_tracker.progress_bar.close()
+            except Exception:
+                pass
+            progress_tracker.progress_bar = None
+        raise e
 
 # =================================================================
 # --- System Optimization and Environment Setup ---
@@ -508,9 +785,12 @@ def find_input_file(filename):
 
 def get_video_duration(video_path):
     """Get video duration in seconds using ffprobe for progress bar calculation."""
+    if not os.path.exists(FFPROBE_BINARY):
+        return None
+
     try:
         cmd = [
-            'ffprobe', '-v', 'quiet', '-print_format', 'json',
+            FFPROBE_BINARY, '-v', 'quiet', '-print_format', 'json',
             '-show_format', video_path
         ]
         result = subprocess.run(cmd, capture_output=True, text=True, check=True)
@@ -526,6 +806,11 @@ def convert_video_to_audio_with_progress(video_path, audio_output_path):
     """
     print(f"\n▶️ Converting video to audio: {os.path.basename(video_path)}")
 
+    # Check if FFmpeg is available
+    if not os.path.exists(FFMPEG_BINARY):
+        print("❌ Error: FFmpeg not found. Please check your Audacity installation.")
+        return None
+
     # Get video duration for progress calculation
     duration = get_video_duration(video_path)
     if duration:
@@ -534,7 +819,7 @@ def convert_video_to_audio_with_progress(video_path, audio_output_path):
     try:
         # Optimized ffmpeg command with progress output
         ffmpeg_cmd = [
-            "ffmpeg", "-y", "-i", video_path,
+            FFMPEG_BINARY, "-y", "-i", video_path,
             "-vn",  # No video
             "-acodec", "libmp3lame",  # Use LAME MP3 encoder
             "-ab", "192k",  # Good quality bitrate
@@ -600,72 +885,127 @@ def convert_video_to_audio_with_progress(video_path, audio_output_path):
             return None
 
     except FileNotFoundError:
-        print("❌ Error: 'ffmpeg' not found. Install with: brew install ffmpeg")
+        print("❌ Error: FFmpeg not accessible. Please check Audacity installation.")
         return None
     except Exception as e:
         print(f"❌ Unexpected error during conversion: {e}")
         return None
 
 def clean_srt_file_english(source_file, target_dir, final_filename, hallucination_lists):
+    """Clean English SRT files by removing hallucinations and duplicate content."""
     print("-> Running English SRT cleaning process...")
     try:
         with open(source_file, 'r', encoding='utf-8') as f:
             subs = list(srt.parse(f.read()))
     except Exception as e:
-        print(f"Error reading SRT file: {e}"); return None
+        print(f"Error reading SRT file: {e}")
+        return None
+
+    # Remove content with patterns like (text), [text], ★text★
     patterns = [r'\(.*?\)', r'\[.*?\]', r'★.*?★']
     subs = [sub for sub in subs if not any(re.search(pattern, sub.content) for pattern in patterns)]
+
+    # Remove hallucination sentences
     hallucination_sentences = [sentence for sublist in hallucination_lists for sentence in sublist]
-    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in map(lambda s: re.sub(r'\W+', '', s).strip(), hallucination_sentences)]
+    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in
+            [re.sub(r'\W+', '', s).strip() for s in hallucination_sentences]]
+
+    # Remove empty content
     subs = [sub for sub in subs if sub.content.strip() != '']
+
+    # Sort by start time and reindex
     subs.sort(key=lambda sub: sub.start)
-    for i, sub in enumerate(subs): sub.index = i + 1
+    for i, sub in enumerate(subs):
+        sub.index = i + 1
+
+    # Remove consecutive duplicates
     i = 0
     while i < len(subs):
         if i < len(subs) - 1 and subs[i].content == subs[i+1].content:
-            subs[i].start = subs[i+1].start; del subs[i+1]; continue
+            subs[i].end = subs[i+1].end
+            del subs[i+1]
+            continue
         i += 1
+
+    # Remove duplicate words within each subtitle
     for sub in subs:
         words = sub.content.split()
         unique_words = [words[0]] if words else []
         for word in words[1:]:
-            if word != unique_words[-1]: unique_words.append(word)
+            if word != unique_words[-1]:
+                unique_words.append(word)
         sub.content = ' '.join(unique_words)
+
+    # Final cleanup and reindexing
     subs = [s for s in subs if s.content.strip() != '']
-    for i, sub in enumerate(subs): sub.index = i + 1
+    for i, sub in enumerate(subs):
+        sub.index = i + 1
+
+    # Save cleaned file
     target_file = os.path.join(target_dir, final_filename)
-    with open(target_file, 'w', encoding='utf-8') as f: f.write(srt.compose(subs))
+    with open(target_file, 'w', encoding='utf-8') as f:
+        f.write(srt.compose(subs))
+
     return target_file
 
 def clean_srt_file_japanese(source_file, target_dir, final_filename, hallucination_lists):
+    """Clean Japanese SRT files by removing hallucinations and unwanted patterns."""
     print("-> Running Japanese SRT cleaning process...")
     try:
         with open(source_file, 'r', encoding='utf-8') as f:
             subs = list(srt.parse(f.read()))
     except Exception as e:
-        print(f"Error reading SRT file: {e}"); return None
-    patterns = [r'★.*?★', r'「.*?」', r'【.*?】', '^「', '^★']
+        print(f"Error reading SRT file: {e}")
+        return None
+
+    # Remove Japanese-specific patterns
+    patterns = [r'★.*?★', r'「.*?」', r'【.*?】', r'^「', r'^★']
     subs = [sub for sub in subs if not any(re.search(pattern, sub.content) for pattern in patterns)]
+
+    # Remove hallucination sentences
     hallucination_sentences = [sentence for sublist in hallucination_lists for sentence in sublist]
-    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in map(lambda s: re.sub(r'\W+', '', s).strip(), hallucination_sentences)]
+    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in
+            [re.sub(r'\W+', '', s).strip() for s in hallucination_sentences]]
+
+    # Remove empty content and reindex
     subs_cleaned = [s for s in subs if s.content.strip() != '']
-    for i, sub in enumerate(subs_cleaned): sub.index = i + 1
+    for i, sub in enumerate(subs_cleaned):
+        sub.index = i + 1
+
+    # Save cleaned file
     target_file = os.path.join(target_dir, final_filename)
-    with open(target_file, 'w', encoding='utf-8') as f: f.write(srt.compose(subs_cleaned))
+    with open(target_file, 'w', encoding='utf-8') as f:
+        f.write(srt.compose(subs_cleaned))
+
     return target_file
 
 def stamp_srt_file(file_path, marker_text):
+    """Add a credit stamp to the beginning of the SRT file."""
     print(f"-> Stamping file with credit: '{marker_text}'")
     try:
         with open(file_path, 'r', encoding='utf-8') as file:
             subs = list(srt.parse(file.read()))
     except Exception as e:
-        print(f"Could not stamp file, error reading: {e}"); return
+        print(f"Could not stamp file, error reading: {e}")
+        return
+
     if marker_text:
-        first_sub = srt.Subtitle(index=1, start=timedelta(0), end=timedelta(milliseconds=1000), content=marker_text)
+        # Create credit subtitle at the beginning
+        first_sub = srt.Subtitle(
+            index=1,
+            start=timedelta(0),
+            end=timedelta(milliseconds=1000),
+            content=marker_text
+        )
         subs.insert(0, first_sub)
-        for i, sub in enumerate(subs, start=1): sub.index = i
-    with open(file_path, 'w', encoding='utf-8') as file: file.write(srt.compose(subs))
+
+        # Reindex all subtitles
+        for i, sub in enumerate(subs, start=1):
+            sub.index = i
+
+    # Save updated file
+    with open(file_path, 'w', encoding='utf-8') as file:
+        file.write(srt.compose(subs))
 
 # =================================================================
 # --- Main Application Logic ---
@@ -675,6 +1015,11 @@ def run_transcription_and_cleaning(input_filename):
     """Main function to run the full transcription and cleaning pipeline with MPS optimization."""
     # 1. Setup Environment and Paths
     print("🚀 --- Initializing Apple Silicon Optimized Transcription --- 🚀")
+
+    # Setup FFmpeg environment first
+    ffmpeg_available = setup_ffmpeg_environment()
+    if not ffmpeg_available:
+        print("⚠️ Limited functionality - video conversion may not work")
 
     # Validate source language before proceeding
     validated_lang, is_valid = validate_and_convert_language(SOURCE_LANGUAGE)
@@ -688,11 +1033,12 @@ def run_transcription_and_cleaning(input_filename):
     source_lang = validated_lang
     print(f"🌐 Source language: {source_lang.upper()}")
 
+    # Create necessary directories
     os.makedirs(SRT_OUTPUT_PATH, exist_ok=True)
     os.makedirs(MODEL_STORAGE_PATH, exist_ok=True)
     os.makedirs(TEMP_PATH, exist_ok=True)
-    os.makedirs(AUDIO_OUTPUT_PATH, exist_ok=True)  # Create audio cache directory
-    os.makedirs(AUDIO_SOURCE_PATH, exist_ok=True)  # Create audio source directory
+    os.makedirs(AUDIO_OUTPUT_PATH, exist_ok=True)
+    os.makedirs(AUDIO_SOURCE_PATH, exist_ok=True)
 
     # Setup offline environment and model caching
     if not setup_offline_environment():
@@ -760,37 +1106,51 @@ def run_transcription_and_cleaning(input_filename):
             MODEL_SIZE, optimal_device, optimal_compute
         )
 
-        # 5. Run Transcription with Progress Monitoring
-        print("\n--- Transcription ---")
+        # 5. Run Transcription with Enhanced Progress Tracking
+        print("\n--- Transcription with Progress Tracking ---")
         print(f"🎬 Processing: {input_filename}")
         print(f"🔧 Device: {actual_device} | Compute: {actual_compute}")
+
+        # Initialize progress tracker
+        progress_tracker = TranscriptionProgressTracker()
 
         start_time = time.time()
 
         # Enhanced transcription parameters for better quality and stability
-        segments, info = model.transcribe(
-            audio=audio_for_transcription,
-            task=TASK,
-            language=source_lang,  # Use validated language code
-            beam_size=5,  # Good balance of quality vs speed
-            vad_filter=True,  # Voice activity detection
-            vad_parameters=dict(min_silence_duration_ms=500),  # Reduce false positive segments
-            word_timestamps=False,  # Disable for better performance unless needed
-            temperature=0.0,  # Deterministic output
-            compression_ratio_threshold=2.4,  # Filter out repetitive segments
-            log_prob_threshold=-1.0,  # Filter out low-confidence segments
-            no_speech_threshold=0.6,  # Sensitivity for detecting speech
-            condition_on_previous_text=True,  # Better context understanding
-            prompt_reset_on_temperature=0.5,  # Reset context if needed
-            initial_prompt=None,  # Could add context-specific prompts here
+        transcription_params = {
+            'task': TASK,
+            'language': source_lang,  # Use validated language code
+            'beam_size': 5,  # Good balance of quality vs speed
+            'vad_filter': True,  # Voice activity detection
+            'vad_parameters': dict(min_silence_duration_ms=500),  # Reduce false positive segments
+            'word_timestamps': False,  # Disable for better performance unless needed
+            'temperature': 0.0,  # Deterministic output
+            'compression_ratio_threshold': 2.4,  # Filter out repetitive segments
+            'log_prob_threshold': -1.0,  # Filter out low-confidence segments
+            'no_speech_threshold': 0.6,  # Sensitivity for detecting speech
+            'condition_on_previous_text': True,  # Better context understanding
+            'prompt_reset_on_temperature': 0.5,  # Reset context if needed
+            'initial_prompt': None,  # Could add context-specific prompts here
+        }
+
+        # Run transcription with progress tracking
+        segment_list, info = transcribe_with_progress(
+            model,
+            audio_for_transcription,
+            progress_tracker,
+            **transcription_params
         )
 
-        # Convert segments to list for processing (with progress)
-        segment_list = list(segments)
         transcription_time = time.time() - start_time
 
         print(f"⏱️ Transcription completed in {transcription_time:.2f} seconds")
-        print(f"📊 Detected language: {info.language} (confidence: {info.language_probability:.2f})")
+        print(f"📊 Total segments processed: {len(segment_list)}")
+
+        # Calculate processing rate
+        audio_duration = get_audio_duration_fast(audio_for_transcription)
+        if audio_duration:
+            processing_rate = audio_duration / transcription_time
+            print(f"🚀 Processing rate: {processing_rate:.1f}x real-time")
 
         # 6. Save Raw SRT (in Temp Folder)
         raw_srt_path = os.path.join(TEMP_PATH, f"{file_basename}.raw.srt")
@@ -816,7 +1176,7 @@ def run_transcription_and_cleaning(input_filename):
         cleaned_srt_path = None
         if TASK == "translate":
             cleaned_srt_path = clean_srt_file_english(raw_srt_path, SRT_OUTPUT_PATH, final_srt_filename, hallucination_lists)
-        else: # transcribe
+        else:  # transcribe
             if source_lang == "ja":  # Use validated language code
                 cleaned_srt_path = clean_srt_file_japanese(raw_srt_path, SRT_OUTPUT_PATH, final_srt_filename, hallucination_lists)
             else:
@@ -831,6 +1191,10 @@ def run_transcription_and_cleaning(input_filename):
             print(f"✅ Final SRT: {cleaned_srt_path}")
             print(f"⏱️ Total processing time: {total_time:.2f} seconds")
             print(f"🚀 Device used: {actual_device} ({actual_compute})")
+
+            if audio_duration:
+                overall_rate = audio_duration / total_time
+                print(f"📊 Overall processing rate: {overall_rate:.1f}x real-time")
 
             if file_type == 'video':
                 print(f"🎵 Audio cached: {os.path.join(AUDIO_OUTPUT_PATH, f'{file_basename}.mp3')}")
@@ -886,7 +1250,7 @@ if __name__ == "__main__":
     print("=" * 60)
 
     parser = argparse.ArgumentParser(
-        description="Apple Silicon optimized transcription with automatic file type detection",
+        description="Apple Silicon optimized transcription with automatic file type detection and progress tracking",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 File Type Support:
@@ -901,6 +1265,12 @@ Audio Caching:
   - Converted audio files are stored in AUDIO_OUTPUT_PATH
   - Cached files are reused for faster processing on repeat runs
   
+Progress Tracking Features:
+  - Real-time progress bars during video conversion
+  - Advanced progress tracking during transcription
+  - Processing rate and performance metrics
+  - Optimized for Apple Silicon M4 performance
+  
 Examples:
   python transcribe.py video.mp4           # Convert video to audio, then transcribe
   python transcribe.py audio.mp3           # Directly transcribe audio file
@@ -910,6 +1280,7 @@ Performance Tips:
   - Audio files process faster (no conversion step)
   - Cached audio files from previous video conversions are reused
   - Close memory-intensive applications for best MPS performance
+  - Progress bars show real-time processing speed and ETA
         """
     )
 
