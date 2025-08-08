@@ -26,7 +26,9 @@ import numpy as np
 CONFIG = {
     "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
     "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
-    "audio_location": "/Volumes/Macintosh HD/Downloads",
+    "mp3_source_location": "/Volumes/Macintosh HD/Downloads",  # Source MP3 files location
+    "mp4_source_location": "/Volumes/Macintosh HD/Downloads/mp4",  # Source MP4 files location
+    "mp3_exp_location": "/Volumes/Macintosh HD/Downloads/mp3/exported",  # Exported MP3 from MP4 conversion
     "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
     "ffmpeg_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffmpeg",
     "ffprobe_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffprobe",
@@ -35,7 +37,8 @@ CONFIG = {
     "vad_threshold": 0.15,
     "chunk_duration": 15.0,
     "credit": "Created using Whisper Transcription Tool",
-    "use_mps": True  # Enable MPS acceleration on Apple Silicon
+    "use_mps": True,  # Enable MPS acceleration on Apple Silicon
+    "save_mp3_to_exp_location": True  # Save converted MP3s to mp3_exp_location instead of temp
 }
 
 # Global constants
@@ -64,7 +67,14 @@ class WhisperTranscriber:
 
     def _ensure_directories(self):
         """Create necessary directories if they don't exist."""
-        for path in [self.config["srt_location"], self.config["temp_location"]]:
+        directories = [
+            self.config["srt_location"],
+            self.config["temp_location"],
+            self.config["mp3_source_location"],  # Source MP3 directory
+            self.config["mp4_source_location"],  # Source MP4 directory
+            self.config["mp3_exp_location"]  # Exported MP3 directory
+        ]
+        for path in directories:
             Path(path).mkdir(parents=True, exist_ok=True)
 
     def _setup_device(self):
@@ -112,7 +122,74 @@ class WhisperTranscriber:
                 )
                 print("Fallback model loaded successfully!")
 
-    def _load_audio(self, audio_path: str) -> Dict[str, Any]:
+    def _find_input_file(self, filename: str) -> str:
+        """Find the input file in the configured source directories.
+
+        Args:
+            filename: The filename to search for (can be with or without full path)
+
+        Returns:
+            str: Full path to the found file
+
+        Raises:
+            FileNotFoundError: If file is not found in any source location
+        """
+        print(f"Searching for file: {filename}")
+
+        # If it's already a full path that exists, use it
+        if os.path.exists(filename):
+            print(f"Found file at provided path: {filename}")
+            return filename
+
+        # Extract just the filename if a path was provided
+        base_filename = os.path.basename(filename)
+        print(f"Base filename: {base_filename}")
+
+        # Search in source directories - try both with and without leading slash
+        search_locations = [
+            self.config["mp3_source_location"],
+            self.config["mp4_source_location"],
+            self.config["mp3_exp_location"],
+            os.getcwd(),  # Current working directory
+            # Also try without leading slash in case of path issues
+            self.config["mp3_source_location"].lstrip('/'),
+            self.config["mp4_source_location"].lstrip('/'),
+            self.config["mp3_exp_location"].lstrip('/'),
+        ]
+
+        # Remove duplicates while preserving order
+        seen = set()
+        search_locations = [x for x in search_locations if not (x in seen or seen.add(x))]
+
+        print(f"Searching in these locations:")
+        for i, location in enumerate(search_locations, 1):
+            potential_path = os.path.join(location, base_filename)
+            print(f"  {i}. {potential_path}")
+
+            # Check if directory exists first
+            if os.path.exists(location):
+                print(f"     Directory exists: ✓")
+                if os.path.exists(potential_path):
+                    print(f"     File found: ✓")
+                    return potential_path
+                else:
+                    print(f"     File not found: ✗")
+            else:
+                print(f"     Directory does not exist: ✗")
+
+        # If still not found, provide helpful error message
+        error_msg = f"File '{base_filename}' not found in any location.\n"
+        error_msg += f"Searched in {len(search_locations)} directories:\n"
+        for i, location in enumerate(search_locations, 1):
+            potential_path = os.path.join(location, base_filename)
+            exists = "✓" if os.path.exists(location) else "✗"
+            error_msg += f"  {i}. {potential_path} (dir exists: {exists})\n"
+        error_msg += f"\nPlease check:\n"
+        error_msg += f"1. File '{base_filename}' exists\n"
+        error_msg += f"2. File is in one of the above directories\n"
+        error_msg += f"3. File permissions allow reading\n"
+
+        raise FileNotFoundError(error_msg)
         """Load audio file using librosa."""
         print(f"Loading audio file: {audio_path}")
 
@@ -125,7 +202,7 @@ class WhisperTranscriber:
             "path": audio_path
         }
 
-    def _check_ffmpeg(self) -> bool:
+    def _convert_timestamps_to_srt(self, chunks: List[Dict], audio_duration: float) -> List[srt.Subtitle]:
         """Convert Hugging Face pipeline timestamps to SRT format."""
         subs = []
 
@@ -161,6 +238,8 @@ class WhisperTranscriber:
             subs.append(sub)
 
         return subs
+
+    def _check_ffmpeg(self) -> bool:
         """Check if ffmpeg and ffprobe are available."""
         ffmpeg_path = self.config["ffmpeg_path"]
         ffprobe_path = self.config["ffprobe_path"]
@@ -191,15 +270,27 @@ class WhisperTranscriber:
         audio_extensions = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.opus', '.flac'}
         return Path(file_path).suffix.lower() in audio_extensions
 
-    def _convert_to_audio(self, video_path: str) -> str:
-        """Convert video file to MP3 audio."""
+    def _convert_to_audio(self, video_path: str) -> tuple[str, bool]:
+        """Convert video file to MP3 audio.
+
+        Returns:
+            tuple: (audio_path, is_temporary) - path to MP3 file and whether it should be cleaned up
+        """
         if not self._check_ffmpeg():
             raise RuntimeError("ffmpeg is required for video conversion")
 
         video_name = Path(video_path).stem
-        audio_path = os.path.join(self.config["temp_location"], f"{video_name}.mp3")
 
-        print(f"Converting video to audio: {video_path}")
+        # Choose output location based on config
+        if self.config.get("save_mp3_to_exp_location", True):
+            audio_path = os.path.join(self.config["mp3_exp_location"], f"{video_name}.mp3")
+            is_temporary = False  # Don't clean up if saving to mp3_exp_location
+            print(f"Converting video to audio (permanent): {video_path}")
+        else:
+            audio_path = os.path.join(self.config["temp_location"], f"{video_name}.mp3")
+            is_temporary = True  # Clean up temp files
+            print(f"Converting video to audio (temporary): {video_path}")
+
         print(f"Output: {audio_path}")
 
         cmd = [
@@ -216,7 +307,7 @@ class WhisperTranscriber:
         try:
             result = subprocess.run(cmd, capture_output=True, text=True, check=True)
             print("Video conversion completed!")
-            return audio_path
+            return audio_path, is_temporary
         except subprocess.CalledProcessError as e:
             print(f"Error converting video: {e}")
             print(f"FFmpeg output: {e.stderr}")
@@ -297,8 +388,7 @@ class WhisperTranscriber:
 
         if self._is_video_file(file_path):
             print("Video file detected, converting to audio...")
-            audio_path = self._convert_to_audio(file_path)
-            temp_audio = True
+            audio_path, temp_audio = self._convert_to_audio(file_path)
         elif not self._is_audio_file(file_path):
             raise ValueError(f"Unsupported file type: {Path(file_path).suffix}")
 
@@ -375,6 +465,9 @@ class WhisperTranscriber:
             print(f"Transcription completed successfully!")
             print(f"SRT file saved: {srt_path}")
             print(f"Total segments: {len(cleaned_subs)}")
+
+            if not temp_audio:
+                print(f"MP3 file saved permanently: {audio_path}")
 
             return srt_path
 
