@@ -1,1298 +1,613 @@
+#!/usr/bin/env python3
+"""
+Whisper Transcription Tool for Mac mini
+Converts video/audio files to English subtitles using faster-whisper
+Usage: python transcribe2.py [file]
+"""
+
 import os
-import pathlib
-import time
-import re
-import datetime
-from datetime import timedelta
-import subprocess
-import shutil
-import argparse
 import sys
-from faster_whisper import WhisperModel
+import json
+import datetime
+import subprocess
+import tempfile
+from pathlib import Path
+from typing import List, Optional, Dict, Any
+import re
 import srt
-import pysrt
+from datetime import timedelta
 from tqdm import tqdm
 import torch
-import json
-import threading
-from queue import Queue
+from transformers import pipeline
+import librosa
+import numpy as np
 
-# =================================================================
-# --- ⚙️ Global Parameters (Configure Everything Here) ---
-# =================================================================
-
-# 1. File & Folder Paths
-VIDEO_SOURCE_PATH = '/Volumes/Macintosh HD/Downloads/Video/uc'
-AUDIO_SOURCE_PATH = '/Volumes/Macintosh HD/Downloads'  # For direct audio input
-SRT_OUTPUT_PATH = '/Volumes/Macintosh HD/Downloads/srt'
-MODEL_STORAGE_PATH = '/Volumes/Macintosh HD/Downloads/srt/whisper_models'
-TEMP_PATH = '/Volumes/Macintosh HD/Downloads/srt/temp'
-AUDIO_OUTPUT_PATH = '/Volumes/Macintosh HD/Downloads/srt/audio_cache'  # Permanent audio storage
-
-# FFmpeg Configuration (Audacity installation)
-FFMPEG_PATH = '/Volumes/250SSD/Library/Application Support/audacity/libs'
-FFMPEG_BINARY = os.path.join(FFMPEG_PATH, 'ffmpeg')
-FFPROBE_BINARY = os.path.join(FFMPEG_PATH, 'ffprobe')
-
-# 2. Language & Task Settings
-SOURCE_LANGUAGE = "ja"              # Source language (ISO code: ja for Japanese)
-TARGET_LANGUAGE_CODE = "en-US"      # NOTE: faster-whisper only translates to English. This sets the output language code.
-TASK = "translate"                  # "transcribe" or "translate"
-
-# 3. Model & Transcription Configuration
-MODEL_SIZE = "large-v3"
-# OPTIMIZED: Auto-detect best device with MPS support
-DEVICE = "auto"  # Will auto-detect MPS, CUDA, or CPU
-COMPUTE_TYPE = "mps" #"auto"  # Will auto-select best compute type for device
-CREDIT = "Subbed by Gemini"
-
-# Model caching configuration
-FORCE_OFFLINE_MODE = False  # Set to True to prevent any internet downloads
-LOCAL_FILES_ONLY = True   # Use only locally cached models
-
-# 4. File Type Configuration
-# Supported video formats for conversion
-VIDEO_EXTENSIONS = ['.mp4', '.mkv', '.avi', '.mov', '.wmv', '.flv', '.webm', '.m4v']
-# Supported audio formats for direct transcription
-AUDIO_EXTENSIONS = ['.mp3', '.wav', '.flac', '.m4a', '.aac', '.ogg', '.wma']
-
-# 5. Advanced Performance Settings
-# MPS-specific optimizations
-MPS_HIGH_WATERMARK_RATIO = 0.0  # Use maximum MPS memory
-CPU_THREADS = 0  # 0 = auto-detect optimal thread count
-NUM_WORKERS = 1  # Number of parallel workers (keep at 1 for MPS stability)
-
-# 6. SRT Cleaning & Word Lists
-PUNCT_MATCH = ["。", "、", ",", ".", "〜", "！", "!", "？", "?", "-"]
-GARBAGE_LIST = ["a", "hmm", "huh", "oh"]
-SUPPRESS_HIGH = ["subscribe", "my channel", "ご視聴ありがとうございました"]
-
-# Language code mapping for output filenames
-TO_LANGUAGE_CODE = {
-    "ja": "ja-JP",      # Japanese
-    "en": "en-US",      # English
-    "es": "es-ES",      # Spanish
-    "fr": "fr-FR",      # French
-    "de": "de-DE",      # German
-    "zh": "zh-CN",      # Chinese (Simplified)
-    "ko": "ko-KR",      # Korean
-    "pt": "pt-BR",      # Portuguese
-    "ru": "ru-RU",      # Russian
-    "it": "it-IT",      # Italian
-    "ar": "ar-SA",      # Arabic
-    "hi": "hi-IN",      # Hindi
-    "th": "th-TH",      # Thai
-    "vi": "vi-VN",      # Vietnamese
-    "nl": "nl-NL",      # Dutch
-    "sv": "sv-SE",      # Swedish
-    "no": "no-NO",      # Norwegian
-    "da": "da-DK",      # Danish
-    "fi": "fi-FI",      # Finnish
-    "pl": "pl-PL",      # Polish
-    "cs": "cs-CZ",      # Czech
-    "hu": "hu-HU",      # Hungarian
-    "tr": "tr-TR",      # Turkish
-    "he": "he-IL",      # Hebrew
-    "id": "id-ID",      # Indonesian
-    "ms": "ms-MY",      # Malay
-    "uk": "uk-UA",      # Ukrainian
+# Master Configuration - Embedded in script
+CONFIG = {
+    "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
+    "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
+    "audio_source": "/Volumes/Macintosh HD/Downloads/audio",  # Source audio files location
+    "video_source": "/Volumes/Macintosh HD/Downloads/video",  # Source video files location
+    "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",  # Exported audio from video conversion
+    "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
+    "ffmpeg_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffmpeg",
+    "ffprobe_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffprobe",
+    "model_size": "openai/whisper-large-v3",
+    "chunk_length_s": 30,
+    "vad_threshold": 0.15,
+    "chunk_duration": 15.0,
+    "credit": "Created using Whisper Transcription Tool",
+    "use_mps": True,  # Enable MPS acceleration on Apple Silicon
+    "save_audio_to_export_location": True  # Save converted audio to audio_export instead of temp
 }
 
-# =================================================================
-# --- Progress Bar Implementation for Transcription ---
-# =================================================================
-
-class TranscriptionProgressTracker:
-    """
-    Advanced progress tracking for Whisper transcription with Apple Silicon optimization.
-    Uses threading to monitor transcription progress without interfering with MPS.
-    """
-
-    def __init__(self, audio_duration=None):
-        self.audio_duration = audio_duration
-        self.progress_bar = None
-        self.segments_processed = 0
-        self.current_time = 0.0
-        self.total_segments = 0
-        self.is_active = False
-        self.segment_queue = Queue()
-        self.last_update_time = time.time()
-
-    def start(self, description="🎤 Transcribing"):
-        """Initialize and start the progress bar."""
-        self.is_active = True
-        self.last_update_time = time.time()
-
-        if self.audio_duration and self.audio_duration > 0:
-            # Time-based progress bar (more accurate)
-            self.progress_bar = tqdm(
-                total=self.audio_duration,
-                desc=description,
-                unit="sec",
-                bar_format="{l_bar}{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}] {rate_fmt}",
-                dynamic_ncols=True,
-                smoothing=0.1  # Smooth the ETA calculation
-            )
-        else:
-            # Segment-based progress bar (fallback) - set total to avoid None issue
-            self.progress_bar = tqdm(
-                total=1000,  # Set a reasonable default total for segments
-                desc=description,
-                unit="seg",
-                bar_format="{l_bar}{bar}| {n} segments [{elapsed}] {rate_fmt}",
-                dynamic_ncols=True
-            )
-
-    def update_segment(self, segment):
-        """Update progress based on processed segment."""
-        if not self.is_active:
-            return
-
-        # Safe check for progress_bar existence
-        if self.progress_bar is None:
-            return
-
-        try:
-            self.segments_processed += 1
-            current_time = time.time()
-
-            # Update based on segment timing
-            if hasattr(segment, 'end'):
-                self.current_time = segment.end
-
-                if self.audio_duration and self.audio_duration > 0:
-                    # Update time-based progress
-                    progress = min(self.current_time, self.audio_duration)
-                    self.progress_bar.n = progress
-                else:
-                    # Update segment-based progress
-                    self.progress_bar.n = self.segments_processed
-                    # Extend total if we exceed the initial estimate
-                    if self.segments_processed >= self.progress_bar.total:
-                        self.progress_bar.total = self.segments_processed + 100
-
-                # Add processing rate info
-                if current_time - self.last_update_time > 0.5:  # Update every 0.5 seconds
-                    self.progress_bar.set_postfix({
-                        'segments': self.segments_processed,
-                        'current': f"{self.current_time:.1f}s"
-                    })
-                    self.progress_bar.refresh()
-                    self.last_update_time = current_time
-
-        except Exception as e:
-            # Silently handle any progress update errors to avoid disrupting transcription
-            pass
-
-    def finish(self):
-        """Complete the progress bar."""
-        if self.progress_bar is not None:
-            try:
-                if self.audio_duration and self.audio_duration > 0:
-                    self.progress_bar.n = self.audio_duration
-                else:
-                    self.progress_bar.n = self.segments_processed
-
-                self.progress_bar.set_postfix({
-                    'segments': self.segments_processed,
-                    'status': 'Complete'
-                })
-                self.progress_bar.close()
-            except Exception:
-                # Ignore any errors during cleanup
-                pass
-            finally:
-                self.progress_bar = None
-
-        self.is_active = False
-
-def setup_ffmpeg_environment():
-    """
-    Setup FFmpeg environment using Audacity's installation.
-    """
-    global FFMPEG_BINARY, FFPROBE_BINARY
-
-    print("🔧 Setting up FFmpeg from Audacity installation...")
-
-    # Check if Audacity's FFmpeg binaries exist
-    if os.path.exists(FFMPEG_BINARY) and os.path.exists(FFPROBE_BINARY):
-        print(f"✅ Found FFmpeg at: {FFMPEG_BINARY}")
-        print(f"✅ Found FFprobe at: {FFPROBE_BINARY}")
-
-        # Make sure binaries are executable
-        try:
-            os.chmod(FFMPEG_BINARY, 0o755)
-            os.chmod(FFPROBE_BINARY, 0o755)
-        except OSError:
-            pass  # Ignore permission errors
-
-        return True
-    else:
-        print(f"❌ FFmpeg not found at: {FFMPEG_PATH}")
-        print("💡 Please check if Audacity is properly installed")
-
-        # Try to find FFmpeg in common locations
-        common_paths = [
-            '/usr/local/bin/ffmpeg',
-            '/opt/homebrew/bin/ffmpeg',
-            '/usr/bin/ffmpeg'
-        ]
-
-        for path in common_paths:
-            if os.path.exists(path):
-                print(f"🔍 Found alternative FFmpeg at: {path}")
-                FFMPEG_BINARY = path
-                FFPROBE_BINARY = path.replace('ffmpeg', 'ffprobe')
-                if os.path.exists(FFPROBE_BINARY):
-                    print(f"✅ Using system FFmpeg installation")
-                    return True
-
-        print("⚠️ No FFmpeg found - some features will be limited")
-        return False
-
-def check_ffmpeg_availability():
-    """
-    Check if ffmpeg and ffprobe are available using our configured paths.
-    """
-    ffmpeg_available = os.path.exists(FFMPEG_BINARY)
-    ffprobe_available = os.path.exists(FFPROBE_BINARY)
-
-    return ffmpeg_available, ffprobe_available
-
-def get_audio_duration_fast(audio_path):
-    """
-    Get audio duration using ffprobe with fallback methods.
-    Returns None if no method works, allowing progress bar to work without duration.
-    """
-    # Check if ffprobe is available
-    if not os.path.exists(FFPROBE_BINARY):
-        print("ℹ️ ffprobe not found - using segment-based progress tracking")
-        return None
-
-    try:
-        # Primary method: JSON output
-        cmd = [
-            FFPROBE_BINARY, '-v', 'quiet', '-print_format', 'json',
-            '-show_format', '-select_streams', 'a:0', audio_path
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True, timeout=15)
-
-        if result.returncode == 0:
-            data = json.loads(result.stdout)
-            duration = float(data['format']['duration'])
-            print(f"⏱️ Audio duration detected: {duration:.2f} seconds")
-            return duration
-        else:
-            # Fallback method: CSV output
-            cmd_simple = [FFPROBE_BINARY, '-v', 'quiet', '-show_entries',
-                         'format=duration', '-of', 'csv=p=0', audio_path]
-            result = subprocess.run(cmd_simple, capture_output=True, text=True, timeout=15)
-            if result.returncode == 0 and result.stdout.strip():
-                duration = float(result.stdout.strip())
-                print(f"⏱️ Audio duration detected (fallback): {duration:.2f} seconds")
-                return duration
-
-    except FileNotFoundError:
-        print("ℹ️ ffprobe not accessible - install FFmpeg or check Audacity installation")
-        return None
-    except (subprocess.TimeoutExpired, subprocess.CalledProcessError,
-            json.JSONDecodeError, ValueError, KeyError) as e:
-        print(f"⚠️ Could not determine audio duration with ffprobe: {e}")
-
-    # Try alternative method using file size estimation (very rough)
-    try:
-        file_size = os.path.getsize(audio_path)
-        # Very rough estimate: assume ~128kbps average bitrate for MP3
-        # This is just a fallback and won't be very accurate
-        estimated_duration = (file_size * 8) / (128 * 1000)  # rough estimate in seconds
-        if estimated_duration > 0:
-            print(f"📊 Using rough file-size based duration estimate: {estimated_duration:.1f} seconds")
-            return estimated_duration
-    except Exception:
-        pass
-
-    print("ℹ️ No audio duration available - using segment-based progress tracking")
-    return None
-
-def transcribe_with_progress(model, audio_path, progress_tracker, **transcribe_kwargs):
-    """
-    Enhanced transcription function with real-time progress tracking.
-    Optimized for Apple Silicon M4 and MPS acceleration.
-    """
-    print(f"\n🎬 Starting transcription with progress tracking...")
-    print(f"🔧 Audio: {os.path.basename(audio_path)}")
-
-    try:
-        # Get audio duration for better progress estimation
-        audio_duration = get_audio_duration_fast(audio_path)
-        if audio_duration:
-            print(f"⏱️ Audio duration: {audio_duration:.2f} seconds")
-            progress_tracker.audio_duration = audio_duration
-
-        # Start progress tracking
-        progress_tracker.start("🎤 Transcribing")
-
-        # Run transcription with enhanced parameters for M4 Mac Mini
-        segments, info = model.transcribe(
-            audio=audio_path,
-            **transcribe_kwargs
-        )
-
-        # Process segments with progress updates
-        segment_list = []
-
-        for segment in segments:
-            segment_list.append(segment)
-            progress_tracker.update_segment(segment)
-
-            # Yield control periodically to prevent blocking on MPS
-            if len(segment_list) % 10 == 0:
-                time.sleep(0.001)  # Tiny sleep to prevent MPS overload
-
-        # Complete progress tracking
-        progress_tracker.finish()
-
-        print(f"✅ Transcription completed!")
-        print(f"📊 Processed {len(segment_list)} segments")
-        print(f"🌐 Detected language: {info.language} (confidence: {info.language_probability:.3f})")
-
-        return segment_list, info
-
-    except Exception as e:
-        # Safe cleanup of progress bar
-        if progress_tracker and hasattr(progress_tracker, 'progress_bar') and progress_tracker.progress_bar is not None:
-            try:
-                progress_tracker.progress_bar.close()
-            except Exception:
-                pass
-            progress_tracker.progress_bar = None
-        raise e
-
-# =================================================================
-# --- System Optimization and Environment Setup ---
-# =================================================================
-
-def fix_openmp_conflicts():
-    """
-    Fix OpenMP library conflicts that can cause crashes.
-    """
-    # Set environment variable to allow duplicate OpenMP libraries
-    # This is a workaround for the common OpenMP conflict issue
-    os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
-    os.environ['OMP_NUM_THREADS'] = '1'  # Limit OpenMP threads to prevent conflicts
-
-    # Additional MKL optimizations for Intel processors
-    os.environ['MKL_NUM_THREADS'] = '1'
-    os.environ['NUMEXPR_NUM_THREADS'] = '1'
-
-    print("🔧 OpenMP conflict fixes applied")
-
-def setup_offline_environment():
-    """
-    Setup environment variables to force offline mode and use local model cache.
-    """
-    print("🔒 Setting up offline environment...")
-
-    # Set Hugging Face cache directory
-    os.environ['HF_HOME'] = MODEL_STORAGE_PATH
-    os.environ['TRANSFORMERS_CACHE'] = MODEL_STORAGE_PATH
-    os.environ['HF_HUB_CACHE'] = MODEL_STORAGE_PATH
-
-    if FORCE_OFFLINE_MODE:
-        # Force offline mode - no internet downloads
-        os.environ['HF_HUB_OFFLINE'] = '1'
-        os.environ['TRANSFORMERS_OFFLINE'] = '1'
-        print("✅ Offline mode enabled - no internet downloads will occur")
-
-    # Create model storage directory structure
-    os.makedirs(MODEL_STORAGE_PATH, exist_ok=True)
-
-    # Check if model exists locally
-    model_exists = check_local_model_exists(MODEL_SIZE)
-    if model_exists:
-        print(f"✅ Model '{MODEL_SIZE}' found locally")
-    else:
-        print(f"⚠️ Model '{MODEL_SIZE}' not found locally")
-        if FORCE_OFFLINE_MODE:
-            print("❌ Cannot proceed in offline mode without cached model")
-            print(f"💡 To download model, temporarily set FORCE_OFFLINE_MODE = False")
-            return False
-        else:
-            print("📥 Model will be downloaded and cached for future offline use")
-
-    return True
-
-def check_local_model_exists(model_size):
-    """
-    Check if the whisper model exists locally in the cache.
-    """
-    # Common paths where faster-whisper stores models
-    possible_paths = [
-        os.path.join(MODEL_STORAGE_PATH, f"models--Systran--faster-whisper-{model_size}"),
-        os.path.join(MODEL_STORAGE_PATH, f"faster-whisper-{model_size}"),
-        os.path.join(MODEL_STORAGE_PATH, f"models--openai--whisper-{model_size}"),
-        os.path.join(MODEL_STORAGE_PATH, model_size),
-    ]
-
-    # Check for key model files
-    key_files = ['model.bin', 'config.json', 'tokenizer.json', 'vocabulary.json', 'preprocessor_config.json']
-
-    for path in possible_paths:
-        if os.path.exists(path):
-            # Check if all required files exist
-            files_found = []
-            for file in key_files:
-                file_path = os.path.join(path, file)
-                if os.path.exists(file_path):
-                    files_found.append(file)
-
-            if len(files_found) >= 3:  # At least 3 key files should exist
-                print(f"📁 Model found at: {path}")
-                print(f"📄 Files found: {', '.join(files_found)}")
-                return True
-
-    return False
-
-def download_and_cache_model(model_size):
-    """
-    Download model with proper caching to ensure offline availability.
-    """
-    print(f"📥 Downloading and caching model '{model_size}'...")
-    print("⚠️ This is a one-time download. Future runs will be offline.")
-
-    # Temporarily disable offline mode for download
-    old_offline = os.environ.get('HF_HUB_OFFLINE', '0')
-    old_transformers_offline = os.environ.get('TRANSFORMERS_OFFLINE', '0')
-
-    os.environ.pop('HF_HUB_OFFLINE', None)
-    os.environ.pop('TRANSFORMERS_OFFLINE', None)
-
-    try:
-        # Create a temporary model instance to trigger download
-        temp_model = WhisperModel(
-            model_size,
-            device="cpu",  # Use CPU for download to avoid device issues
-            compute_type="int8",
-            download_root=MODEL_STORAGE_PATH,
-            local_files_only=False  # Allow download
-        )
-
-        print("✅ Model downloaded and cached successfully")
-
-        # Clean up temporary model
-        del temp_model
-
-        # Restore offline settings
-        if old_offline == '1':
-            os.environ['HF_HUB_OFFLINE'] = '1'
-        if old_transformers_offline == '1':
-            os.environ['TRANSFORMERS_OFFLINE'] = '1'
-
-        return True
-
-    except Exception as e:
-        print(f"❌ Failed to download model: {e}")
-        return False
-
-def detect_optimal_device_and_compute():
-    """
-    Detect the best available device and compute type for Apple Silicon M4.
-    Returns tuple of (device, compute_type)
-    """
-    print("🔍 Detecting optimal device configuration...")
-
-    # Fix OpenMP conflicts before device detection
-    fix_openmp_conflicts()
-
-    # Check system architecture first
-    import platform
-    system_info = platform.platform()
-    print(f"📱 System: {system_info}")
-
-    # Check for Apple Silicon specifically
-    is_apple_silicon = platform.processor() == 'arm' or 'arm64' in platform.machine().lower()
-
-    if is_apple_silicon:
-        print("🍎 Apple Silicon detected!")
-
-        # Check for MPS availability with better error handling
-        try:
-            if torch.backends.mps.is_available() and torch.backends.mps.is_built():
-                print("✅ MPS backend is available and built")
-
-                # Test MPS functionality
-                try:
-                    test_tensor = torch.tensor([1.0]).to('mps')
-                    del test_tensor
-                    torch.mps.empty_cache()
-                    print("✅ MPS functionality test passed")
-
-                    # Set MPS memory optimization
-                    if hasattr(torch.mps, 'set_per_process_memory_fraction'):
-                        torch.mps.set_per_process_memory_fraction(0.8)
-
-                    os.environ['PYTORCH_MPS_HIGH_WATERMARK_RATIO'] = str(MPS_HIGH_WATERMARK_RATIO)
-                    return "mps", "float16"
-
-                except Exception as mps_error:
-                    print(f"⚠️ MPS test failed: {mps_error}")
-                    print("🔄 Falling back to optimized CPU")
-
-            else:
-                print("⚠️ MPS backend not available or not built")
-
-        except Exception as e:
-            print(f"⚠️ MPS detection error: {e}")
-
-    # Check for CUDA (unlikely on Mac but just in case)
-    elif torch.cuda.is_available():
-        print("✅ CUDA detected!")
-        return "cuda", "float16"
-
-    # Fallback to optimized CPU with better compute type for Apple Silicon
-    print("🔧 Using CPU with optimizations")
-    if is_apple_silicon:
-        return "cpu", "float32"  # Better for Apple Silicon
-    else:
-        return "cpu", "int8"
-
-def optimize_for_apple_silicon():
-    """Apply Apple Silicon specific optimizations."""
-    import platform
-
-    # Fix OpenMP conflicts first
-    fix_openmp_conflicts()
-
-    is_apple_silicon = platform.processor() == 'arm' or 'arm64' in platform.machine().lower()
-
-    if is_apple_silicon:
-        print("🚀 Applying Apple Silicon optimizations...")
-
-        # Set optimal thread count for Apple Silicon
-        if CPU_THREADS == 0:
-            # M4 typically has 10 cores (4P + 6E), but limit for stability
-            optimal_threads = min(torch.get_num_threads(), 4)  # Conservative threading
-            torch.set_num_threads(optimal_threads)
-            print(f"📊 Using {optimal_threads} CPU threads")
-        else:
-            torch.set_num_threads(CPU_THREADS)
-
-        # Enable MPS fallback for unsupported operations only if MPS is available
-        if torch.backends.mps.is_available():
-            os.environ['PYTORCH_ENABLE_MPS_FALLBACK'] = '1'
-
-            # Clear any existing MPS cache
-            try:
-                torch.mps.empty_cache()
-            except:
-                pass  # Ignore if MPS cache operations fail
-
-        print("✅ Apple Silicon optimizations applied")
-    else:
-        print("🔧 Applying Intel/x86 optimizations...")
-        # Conservative settings for Intel processors
-        if CPU_THREADS == 0:
-            optimal_threads = min(torch.get_num_threads(), 4)
-            torch.set_num_threads(optimal_threads)
-            print(f"📊 Using {optimal_threads} CPU threads")
-        print("✅ Intel optimizations applied")
-
-def setup_model_with_fallback(model_size, device, compute_type):
-    """
-    Setup WhisperModel with intelligent fallback and proper offline caching.
-    """
-    print(f"📦 Loading Whisper model '{model_size}' from cache...")
-    print(f"🎯 Target device: {device}, compute_type: {compute_type}")
-
-    # Apply additional fixes for stability
-    fix_openmp_conflicts()
-
-    # First, try with the detected optimal settings and local files only
-    try:
-        model = WhisperModel(
-            model_size,
-            device=device,
-            compute_type=compute_type,
-            download_root=MODEL_STORAGE_PATH,
-            local_files_only=LOCAL_FILES_ONLY,  # Force local files only
-            num_workers=1  # Force single worker to prevent multiprocessing issues
-        )
-        print(f"✅ Model loaded successfully on {device} with {compute_type} (offline)")
-        return model, device, compute_type
-
-    except Exception as e:
-        print(f"⚠️ Failed to load from cache on {device}: {e}")
-
-        # If offline mode is disabled and model not found, try to download
-        if not FORCE_OFFLINE_MODE and ("No such file or directory" in str(e) or "not found" in str(e).lower()):
-            print("📥 Attempting to download model for first-time setup...")
-            if download_and_cache_model(model_size):
-                # Try again after download
-                try:
-                    model = WhisperModel(
-                        model_size,
-                        device=device,
-                        compute_type=compute_type,
-                        download_root=MODEL_STORAGE_PATH,
-                        local_files_only=True,  # Now use cached version
-                        num_workers=1
-                    )
-                    print(f"✅ Model loaded after download on {device} with {compute_type}")
-                    return model, device, compute_type
-                except Exception as download_error:
-                    print(f"❌ Still failed after download: {download_error}")
-
-        # Try fallback combinations with more conservative settings
-        fallback_configs = [
-            ("cpu", "float32"),  # Better for Apple Silicon
-            ("cpu", "int8"),     # Most compatible
-            ("auto", "auto")     # Let the library decide
-        ]
-
-        for fallback_device, fallback_compute in fallback_configs:
-            try:
-                print(f"🔄 Trying fallback: {fallback_device} with {fallback_compute}")
-                model = WhisperModel(
-                    model_size,
-                    device=fallback_device,
-                    compute_type=fallback_compute,
-                    download_root=MODEL_STORAGE_PATH,
-                    local_files_only=LOCAL_FILES_ONLY,
-                    num_workers=1  # Single worker for stability
-                )
-                print(f"✅ Model loaded on fallback: {fallback_device} with {fallback_compute} (offline)")
-                return model, fallback_device, fallback_compute
-
-            except Exception as fallback_error:
-                print(f"❌ Fallback {fallback_device} failed: {fallback_error}")
-                continue
-
-        # If all fallbacks fail
-        error_msg = "Unable to load model. "
-        if LOCAL_FILES_ONLY:
-            error_msg += "Try downloading the model first by setting FORCE_OFFLINE_MODE = False"
-        raise Exception(error_msg)
-
-# =================================================================
-# --- Language Support and Validation ---
-# =================================================================
-
-# Supported language codes for faster-whisper (ISO 639-1 codes)
-SUPPORTED_LANGUAGES = [
-    'af', 'am', 'ar', 'as', 'az', 'ba', 'be', 'bg', 'bn', 'bo', 'br', 'bs',
-    'ca', 'cs', 'cy', 'da', 'de', 'el', 'en', 'es', 'et', 'eu', 'fa', 'fi',
-    'fo', 'fr', 'gl', 'gu', 'ha', 'haw', 'he', 'hi', 'hr', 'ht', 'hu', 'hy',
-    'id', 'is', 'it', 'ja', 'jw', 'ka', 'kk', 'km', 'kn', 'ko', 'la', 'lb',
-    'ln', 'lo', 'lt', 'lv', 'mg', 'mi', 'mk', 'ml', 'mn', 'mr', 'ms', 'mt',
-    'my', 'ne', 'nl', 'nn', 'no', 'oc', 'pa', 'pl', 'ps', 'pt', 'ro', 'ru',
-    'sa', 'sd', 'si', 'sk', 'sl', 'sn', 'so', 'sq', 'sr', 'su', 'sv', 'sw',
-    'ta', 'te', 'tg', 'th', 'tk', 'tl', 'tr', 'tt', 'uk', 'ur', 'uz', 'vi',
-    'yi', 'yo', 'zh', 'yue'
+# Global constants
+TQDM_FORMAT = "{desc}: {percentage:3.1f}% |{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate:.2f} audio s / real time s]"
+
+# Garbage patterns to remove from transcriptions
+GARBAGE_PATTERNS = [
+    "Thank you.",
+    "Thanks for watching.",
+    "Please subscribe.",
+    "Don't forget to like and subscribe.",
+    "See you next time.",
+    "Bye bye.",
 ]
 
-# Common language name to ISO code mapping for user convenience
-LANGUAGE_NAME_TO_CODE = {
-    'japanese': 'ja', 'english': 'en', 'spanish': 'es', 'french': 'fr',
-    'german': 'de', 'chinese': 'zh', 'korean': 'ko', 'portuguese': 'pt',
-    'russian': 'ru', 'italian': 'it', 'arabic': 'ar', 'hindi': 'hi',
-    'thai': 'th', 'vietnamese': 'vi', 'dutch': 'nl', 'swedish': 'sv',
-    'norwegian': 'no', 'danish': 'da', 'finnish': 'fi', 'polish': 'pl',
-    'czech': 'cs', 'hungarian': 'hu', 'turkish': 'tr', 'hebrew': 'he',
-    'indonesian': 'id', 'malay': 'ms', 'ukrainian': 'uk'
-}
+REMOVE_QUOTES = dict.fromkeys(map(ord, '"„"‟"＂「」'), None)
 
-def validate_and_convert_language(language_input):
-    """
-    Validate language input and convert to proper ISO code if needed.
-    Returns: (valid_iso_code, is_valid)
-    """
-    if not language_input:
-        return None, False
 
-    lang_lower = language_input.lower().strip()
+class WhisperTranscriber:
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.pipe = None
+        self.device = None
+        self._ensure_directories()
+        self._setup_device()
 
-    # Check if it's already a valid ISO code
-    if lang_lower in SUPPORTED_LANGUAGES:
-        return lang_lower, True
-
-    # Check if it's a language name that can be converted
-    if lang_lower in LANGUAGE_NAME_TO_CODE:
-        iso_code = LANGUAGE_NAME_TO_CODE[lang_lower]
-        print(f"📝 Converting '{language_input}' to ISO code: '{iso_code}'")
-        return iso_code, True
-
-    return language_input, False
-
-def print_language_help():
-    """Print helpful language information."""
-    print("\n📚 Language Code Reference:")
-    print("Common languages and their codes:")
-    popular_langs = {
-        'ja': 'Japanese', 'en': 'English', 'es': 'Spanish', 'fr': 'French',
-        'de': 'German', 'zh': 'Chinese', 'ko': 'Korean', 'pt': 'Portuguese',
-        'ru': 'Russian', 'it': 'Italian', 'ar': 'Arabic', 'hi': 'Hindi'
-    }
-
-    for code, name in popular_langs.items():
-        print(f"  {code:<3} = {name}")
-
-    print(f"\n💡 You can also use full names like 'japanese' (will convert to 'ja')")
-    print(f"📋 Total supported languages: {len(SUPPORTED_LANGUAGES)}")
-
-# =================================================================
-# --- File Type Detection and Path Resolution ---
-# =================================================================
-
-def detect_file_type(filename):
-    """
-    Detect if the input file is a video or audio file.
-    Returns: 'video', 'audio', or 'unknown'
-    """
-    _, ext = os.path.splitext(filename.lower())
-
-    if ext in VIDEO_EXTENSIONS:
-        return 'video'
-    elif ext in AUDIO_EXTENSIONS:
-        return 'audio'
-    else:
-        return 'unknown'
-
-def find_input_file(filename):
-    """
-    Find the input file in either video or audio source paths.
-    Returns: (full_path, file_type) or (None, None) if not found
-    """
-    # Try video path first
-    video_path = os.path.join(VIDEO_SOURCE_PATH, filename)
-    if os.path.exists(video_path):
-        file_type = detect_file_type(filename)
-        return video_path, file_type
-
-    # Try audio path
-    audio_path = os.path.join(AUDIO_SOURCE_PATH, filename)
-    if os.path.exists(audio_path):
-        file_type = detect_file_type(filename)
-        return audio_path, file_type
-
-    # Try both paths regardless of detected type (in case user has misnamed files)
-    for path in [VIDEO_SOURCE_PATH, AUDIO_SOURCE_PATH]:
-        full_path = os.path.join(path, filename)
-        if os.path.exists(full_path):
-            file_type = detect_file_type(filename)
-            return full_path, file_type
-
-    return None, None
-
-def get_video_duration(video_path):
-    """Get video duration in seconds using ffprobe for progress bar calculation."""
-    if not os.path.exists(FFPROBE_BINARY):
-        return None
-
-    try:
-        cmd = [
-            FFPROBE_BINARY, '-v', 'quiet', '-print_format', 'json',
-            '-show_format', video_path
+    def _ensure_directories(self):
+        """Create necessary directories if they don't exist."""
+        directories = [
+            self.config["srt_location"],
+            self.config["temp_location"],
+            self.config["audio_source"],
+            self.config["video_source"],
+            self.config["audio_export"],
+            self.config["whisper_models_location"]
         ]
-        result = subprocess.run(cmd, capture_output=True, text=True, check=True)
-        data = json.loads(result.stdout)
-        duration = float(data['format']['duration'])
-        return duration
-    except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError, ValueError):
-        return None
+        for path in directories:
+            Path(path).mkdir(parents=True, exist_ok=True)
 
-def convert_video_to_audio_with_progress(video_path, audio_output_path):
-    """
-    Converts a video file to MP3 using ffmpeg with real-time progress bar.
-    """
-    print(f"\n▶️ Converting video to audio: {os.path.basename(video_path)}")
-
-    # Check if FFmpeg is available
-    if not os.path.exists(FFMPEG_BINARY):
-        print("❌ Error: FFmpeg not found. Please check your Audacity installation.")
-        return None
-
-    # Get video duration for progress calculation
-    duration = get_video_duration(video_path)
-    if duration:
-        print(f"📹 Video duration: {duration:.1f} seconds")
-
-    try:
-        # Optimized ffmpeg command with progress output
-        ffmpeg_cmd = [
-            FFMPEG_BINARY, "-y", "-i", video_path,
-            "-vn",  # No video
-            "-acodec", "libmp3lame",  # Use LAME MP3 encoder
-            "-ab", "192k",  # Good quality bitrate
-            "-ar", "44100",  # Standard sample rate
-            "-ac", "2",  # Stereo
-            "-progress", "pipe:1",  # Output progress to stdout
-            audio_output_path
-        ]
-
-        # Start ffmpeg process
-        process = subprocess.Popen(
-            ffmpeg_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            universal_newlines=True,
-            bufsize=1
-        )
-
-        # Initialize progress bar
-        progress_bar = None
-        if duration:
-            progress_bar = tqdm(
-                total=duration,
-                desc="🎵 Converting",
-                unit="sec",
-                bar_format="{l_bar}{bar}| {n:.1f}/{total:.1f}s [{elapsed}<{remaining}] {rate_fmt}"
-            )
-
-        # Parse ffmpeg progress output
-        current_time = 0
-        for line in process.stdout:
-            line = line.strip()
-            if line.startswith('out_time_ms='):
-                try:
-                    # Extract time in microseconds and convert to seconds
-                    time_ms = int(line.split('=')[1])
-                    current_time = time_ms / 1000000.0  # Convert to seconds
-
-                    if progress_bar and current_time <= duration:
-                        progress_bar.n = current_time
-                        progress_bar.refresh()
-                except (ValueError, IndexError):
-                    continue
-            elif line.startswith('progress=end'):
-                if progress_bar:
-                    progress_bar.n = duration if duration else progress_bar.total
-                    progress_bar.refresh()
-                break
-
-        # Wait for process to complete
-        process.wait()
-
-        if progress_bar:
-            progress_bar.close()
-
-        if process.returncode == 0:
-            print(f"✅ Conversion successful: {os.path.basename(audio_output_path)}")
-            return audio_output_path
+    def _setup_device(self):
+        """Setup the best available device (MPS, CUDA, or CPU)."""
+        if self.config.get("use_mps", True) and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            print("Using Apple Silicon MPS acceleration")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+            print("Using CUDA acceleration")
         else:
-            stderr_output = process.stderr.read() if process.stderr else "No error details"
-            print(f"❌ FFmpeg conversion failed with return code {process.returncode}")
-            print(f"   Error details: {stderr_output}")
-            return None
+            self.device = torch.device("cpu")
+            print("Using CPU (no acceleration available)")
 
-    except FileNotFoundError:
-        print("❌ Error: FFmpeg not accessible. Please check Audacity installation.")
-        return None
-    except Exception as e:
-        print(f"❌ Unexpected error during conversion: {e}")
-        return None
+    def _check_model_exists(self) -> bool:
+        """Check if the Whisper model is already downloaded."""
+        cache_dir = self.config["whisper_models_location"]
+        model_name = self.config["model_size"].replace("/", "--")
 
-def clean_srt_file_english(source_file, target_dir, final_filename, hallucination_lists):
-    """Clean English SRT files by removing hallucinations and duplicate content."""
-    print("-> Running English SRT cleaning process...")
-    try:
-        with open(source_file, 'r', encoding='utf-8') as f:
-            subs = list(srt.parse(f.read()))
-    except Exception as e:
-        print(f"Error reading SRT file: {e}")
-        return None
+        # Check for common cached model directory patterns
+        potential_paths = [
+            os.path.join(cache_dir, "models--" + model_name),
+            os.path.join(cache_dir, model_name),
+            os.path.join(cache_dir, self.config["model_size"]),
+        ]
 
-    # Remove content with patterns like (text), [text], ★text★
-    patterns = [r'\(.*?\)', r'\[.*?\]', r'★.*?★']
-    subs = [sub for sub in subs if not any(re.search(pattern, sub.content) for pattern in patterns)]
+        for path in potential_paths:
+            if os.path.exists(path) and os.listdir(path):
+                print(f"Found cached model at: {path}")
+                return True
 
-    # Remove hallucination sentences
-    hallucination_sentences = [sentence for sublist in hallucination_lists for sentence in sublist]
-    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in
-            [re.sub(r'\W+', '', s).strip() for s in hallucination_sentences]]
+        return False
 
-    # Remove empty content
-    subs = [sub for sub in subs if sub.content.strip() != '']
-
-    # Sort by start time and reindex
-    subs.sort(key=lambda sub: sub.start)
-    for i, sub in enumerate(subs):
-        sub.index = i + 1
-
-    # Remove consecutive duplicates
-    i = 0
-    while i < len(subs):
-        if i < len(subs) - 1 and subs[i].content == subs[i+1].content:
-            subs[i].end = subs[i+1].end
-            del subs[i+1]
-            continue
-        i += 1
-
-    # Remove duplicate words within each subtitle
-    for sub in subs:
-        words = sub.content.split()
-        unique_words = [words[0]] if words else []
-        for word in words[1:]:
-            if word != unique_words[-1]:
-                unique_words.append(word)
-        sub.content = ' '.join(unique_words)
-
-    # Final cleanup and reindexing
-    subs = [s for s in subs if s.content.strip() != '']
-    for i, sub in enumerate(subs):
-        sub.index = i + 1
-
-    # Save cleaned file
-    target_file = os.path.join(target_dir, final_filename)
-    with open(target_file, 'w', encoding='utf-8') as f:
-        f.write(srt.compose(subs))
-
-    return target_file
-
-def clean_srt_file_japanese(source_file, target_dir, final_filename, hallucination_lists):
-    """Clean Japanese SRT files by removing hallucinations and unwanted patterns."""
-    print("-> Running Japanese SRT cleaning process...")
-    try:
-        with open(source_file, 'r', encoding='utf-8') as f:
-            subs = list(srt.parse(f.read()))
-    except Exception as e:
-        print(f"Error reading SRT file: {e}")
-        return None
-
-    # Remove Japanese-specific patterns
-    patterns = [r'★.*?★', r'「.*?」', r'【.*?】', r'^「', r'^★']
-    subs = [sub for sub in subs if not any(re.search(pattern, sub.content) for pattern in patterns)]
-
-    # Remove hallucination sentences
-    hallucination_sentences = [sentence for sublist in hallucination_lists for sentence in sublist]
-    subs = [sub for sub in subs if re.sub(r'\W+', '', sub.content).strip() not in
-            [re.sub(r'\W+', '', s).strip() for s in hallucination_sentences]]
-
-    # Remove empty content and reindex
-    subs_cleaned = [s for s in subs if s.content.strip() != '']
-    for i, sub in enumerate(subs_cleaned):
-        sub.index = i + 1
-
-    # Save cleaned file
-    target_file = os.path.join(target_dir, final_filename)
-    with open(target_file, 'w', encoding='utf-8') as f:
-        f.write(srt.compose(subs_cleaned))
-
-    return target_file
-
-def stamp_srt_file(file_path, marker_text):
-    """Add a credit stamp to the beginning of the SRT file."""
-    print(f"-> Stamping file with credit: '{marker_text}'")
-    try:
-        with open(file_path, 'r', encoding='utf-8') as file:
-            subs = list(srt.parse(file.read()))
-    except Exception as e:
-        print(f"Could not stamp file, error reading: {e}")
-        return
-
-    if marker_text:
-        # Create credit subtitle at the beginning
-        first_sub = srt.Subtitle(
-            index=1,
-            start=timedelta(0),
-            end=timedelta(milliseconds=1000),
-            content=marker_text
-        )
-        subs.insert(0, first_sub)
-
-        # Reindex all subtitles
-        for i, sub in enumerate(subs, start=1):
-            sub.index = i
-
-    # Save updated file
-    with open(file_path, 'w', encoding='utf-8') as file:
-        file.write(srt.compose(subs))
-
-# =================================================================
-# --- Main Application Logic ---
-# =================================================================
-
-def run_transcription_and_cleaning(input_filename):
-    """Main function to run the full transcription and cleaning pipeline with MPS optimization."""
-    # 1. Setup Environment and Paths
-    print("🚀 --- Initializing Apple Silicon Optimized Transcription --- 🚀")
-
-    # Setup FFmpeg environment first
-    ffmpeg_available = setup_ffmpeg_environment()
-    if not ffmpeg_available:
-        print("⚠️ Limited functionality - video conversion may not work")
-
-    # Validate source language before proceeding
-    validated_lang, is_valid = validate_and_convert_language(SOURCE_LANGUAGE)
-    if not is_valid:
-        print(f"❌ Invalid language code: '{SOURCE_LANGUAGE}'")
-        print(f"🔍 Supported codes: {', '.join(SUPPORTED_LANGUAGES[:20])}...")
-        print_language_help()
-        return
-
-    # Use validated language code
-    source_lang = validated_lang
-    print(f"🌐 Source language: {source_lang.upper()}")
-
-    # Create necessary directories
-    os.makedirs(SRT_OUTPUT_PATH, exist_ok=True)
-    os.makedirs(MODEL_STORAGE_PATH, exist_ok=True)
-    os.makedirs(TEMP_PATH, exist_ok=True)
-    os.makedirs(AUDIO_OUTPUT_PATH, exist_ok=True)
-    os.makedirs(AUDIO_SOURCE_PATH, exist_ok=True)
-
-    # Setup offline environment and model caching
-    if not setup_offline_environment():
-        return
-
-    # Apply Apple Silicon optimizations
-    optimize_for_apple_silicon()
-
-    # 2. Find and identify input file
-    input_path, file_type = find_input_file(input_filename)
-    if not input_path:
-        print(f"❌ Error: Input file '{input_filename}' not found in:")
-        print(f"   📁 Video path: {VIDEO_SOURCE_PATH}")
-        print(f"   🎵 Audio path: {AUDIO_SOURCE_PATH}")
-        return
-
-    file_basename = os.path.splitext(input_filename)[0]
-
-    print(f"\n📁 Found file: {input_path}")
-    print(f"📋 File type: {file_type.upper()}")
-
-    try:
-        # 3. Handle Audio Preparation Based on File Type
-        audio_for_transcription = None
-
-        if file_type == 'video':
-            print(f"\n🎬 Processing video file...")
-
-            # Check if converted audio already exists in cache
-            cached_audio_path = os.path.join(AUDIO_OUTPUT_PATH, f"{file_basename}.mp3")
-
-            if os.path.exists(cached_audio_path):
-                print(f"🎵 Found cached audio file: {os.path.basename(cached_audio_path)}")
-                user_choice = input("Use cached audio? (y/n, default=y): ").lower().strip()
-
-                if user_choice in ['', 'y', 'yes']:
-                    audio_for_transcription = cached_audio_path
-                    print("✅ Using cached audio file")
-                else:
-                    print("🔄 Re-converting video to audio...")
-                    audio_for_transcription = convert_video_to_audio_with_progress(input_path, cached_audio_path)
+    def _load_model(self):
+        """Load the Whisper model using Hugging Face pipeline."""
+        if self.pipe is None:
+            # Check if model is already downloaded
+            model_exists = self._check_model_exists()
+            if model_exists:
+                print(f"Using cached Whisper model: {self.config['model_size']}")
             else:
-                print("🎵 Converting video to audio (will be cached for future use)...")
-                audio_for_transcription = convert_video_to_audio_with_progress(input_path, cached_audio_path)
+                print(f"Downloading Whisper model: {self.config['model_size']}")
 
-            if not audio_for_transcription:
-                raise Exception("Video to audio conversion failed.")
+            # Set cache directory to our models location
+            cache_dir = self.config["whisper_models_location"]
+            os.makedirs(cache_dir, exist_ok=True)
 
-        elif file_type == 'audio':
-            print(f"\n🎵 Processing audio file directly...")
-            audio_for_transcription = input_path
-            print(f"✅ Using audio file: {os.path.basename(audio_for_transcription)}")
+            try:
+                self.pipe = pipeline(
+                    "automatic-speech-recognition",
+                    model=self.config["model_size"],
+                    chunk_length_s=self.config["chunk_length_s"],
+                    device=self.device,
+                    model_kwargs={"cache_dir": cache_dir},
+                    return_timestamps=True
+                )
+                print("Model loaded successfully!")
+            except Exception as e:
+                print(f"Error loading model: {e}")
+                print("Falling back to smaller model...")
+                # Fallback to a smaller model if the large one fails
+                self.pipe = pipeline(
+                    "automatic-speech-recognition",
+                    model="openai/whisper-base",
+                    chunk_length_s=self.config["chunk_length_s"],
+                    device=self.device,
+                    model_kwargs={"cache_dir": cache_dir},
+                    return_timestamps=True
+                )
+                print("Fallback model loaded successfully!")
 
+    def _is_video_file_by_extension(self, extension: str) -> bool:
+        """Check if the file extension indicates a video file."""
+        video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
+        return extension.lower() in video_extensions
+
+    def _is_audio_file_by_extension(self, extension: str) -> bool:
+        """Check if the file extension indicates an audio file."""
+        audio_extensions = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.opus', '.flac'}
+        return extension.lower() in audio_extensions
+
+    def _is_video_file(self, file_path: str) -> bool:
+        """Check if the file is a video file."""
+        return self._is_video_file_by_extension(Path(file_path).suffix)
+
+    def _is_audio_file(self, file_path: str) -> bool:
+        """Check if the file is an audio file."""
+        return self._is_audio_file_by_extension(Path(file_path).suffix)
+
+    def _find_input_file(self, filename: str) -> str:
+        """Find the input file in the configured source directories.
+
+        Args:
+            filename: The filename to search for (can be with or without full path)
+
+        Returns:
+            str: Full path to the found file
+
+        Raises:
+            FileNotFoundError: If file is not found in any source location
+        """
+        print(f"Searching for file: {filename}")
+
+        # If it's already a full path that exists, use it
+        if os.path.exists(filename):
+            print(f"Found file at provided path: {filename}")
+            return filename
+
+        # Extract just the filename if a path was provided
+        base_filename = os.path.basename(filename)
+        print(f"Base filename: {base_filename}")
+
+        # Determine file type and search in appropriate directories
+        file_extension = Path(base_filename).suffix.lower()
+
+        # Define search locations based on file type
+        if self._is_audio_file_by_extension(file_extension):
+            primary_locations = [self.config["audio_source"], self.config["audio_export"]]
+            print(f"Audio file detected, searching in audio directories first")
+        elif self._is_video_file_by_extension(file_extension):
+            primary_locations = [self.config["video_source"]]
+            print(f"Video file detected, searching in video directories first")
         else:
-            supported_formats = VIDEO_EXTENSIONS + AUDIO_EXTENSIONS
-            print(f"❌ Unsupported file format. Supported formats:")
-            print(f"   📹 Video: {', '.join(VIDEO_EXTENSIONS)}")
-            print(f"   🎵 Audio: {', '.join(AUDIO_EXTENSIONS)}")
-            return
+            primary_locations = []
+            print(f"Unknown file type, searching in all directories")
 
-        # 4. Setup Model with Optimal Device Detection
-        print("\n--- Model Setup ---")
-        optimal_device, optimal_compute = detect_optimal_device_and_compute()
-        model, actual_device, actual_compute = setup_model_with_fallback(
-            MODEL_SIZE, optimal_device, optimal_compute
-        )
+        # Build complete search list (primary locations first, then fallbacks)
+        search_locations = primary_locations + [
+            self.config["audio_source"],
+            self.config["video_source"],
+            self.config["audio_export"],
+            os.getcwd(),  # Current working directory
+        ]
 
-        # 5. Run Transcription with Enhanced Progress Tracking
-        print("\n--- Transcription with Progress Tracking ---")
-        print(f"🎬 Processing: {input_filename}")
-        print(f"🔧 Device: {actual_device} | Compute: {actual_compute}")
+        # Remove duplicates while preserving order
+        seen = set()
+        search_locations = [x for x in search_locations if not (x in seen or seen.add(x))]
 
-        # Initialize progress tracker
-        progress_tracker = TranscriptionProgressTracker()
+        print(f"Searching in these locations:")
+        for i, location in enumerate(search_locations, 1):
+            potential_path = os.path.join(location, base_filename)
+            print(f"  {i}. {potential_path}")
 
-        start_time = time.time()
+            # Check if directory exists first
+            if os.path.exists(location):
+                print(f"     Directory exists: ✓")
+                if os.path.exists(potential_path):
+                    print(f"     File found: ✓")
+                    return potential_path
+                else:
+                    print(f"     File not found: ✗")
+            else:
+                print(f"     Directory does not exist: ✗")
 
-        # Enhanced transcription parameters for better quality and stability
-        transcription_params = {
-            'task': TASK,
-            'language': source_lang,  # Use validated language code
-            'beam_size': 5,  # Good balance of quality vs speed
-            'vad_filter': True,  # Voice activity detection
-            'vad_parameters': dict(min_silence_duration_ms=500),  # Reduce false positive segments
-            'word_timestamps': False,  # Disable for better performance unless needed
-            'temperature': 0.0,  # Deterministic output
-            'compression_ratio_threshold': 2.4,  # Filter out repetitive segments
-            'log_prob_threshold': -1.0,  # Filter out low-confidence segments
-            'no_speech_threshold': 0.6,  # Sensitivity for detecting speech
-            'condition_on_previous_text': True,  # Better context understanding
-            'prompt_reset_on_temperature': 0.5,  # Reset context if needed
-            'initial_prompt': None,  # Could add context-specific prompts here
+        # If still not found, provide helpful error message
+        error_msg = f"File '{base_filename}' not found in any location.\n"
+        error_msg += f"Searched in {len(search_locations)} directories:\n"
+        for i, location in enumerate(search_locations, 1):
+            potential_path = os.path.join(location, base_filename)
+            exists = "✓" if os.path.exists(location) else "✗"
+            error_msg += f"  {i}. {potential_path} (dir exists: {exists})\n"
+        error_msg += f"\nPlease check:\n"
+        error_msg += f"1. File '{base_filename}' exists\n"
+        error_msg += f"2. For audio files: place in {self.config['audio_source']}\n"
+        error_msg += f"3. For video files: place in {self.config['video_source']}\n"
+        error_msg += f"4. File permissions allow reading\n"
+
+        raise FileNotFoundError(error_msg)
+
+    def _load_audio(self, audio_path: str) -> Dict[str, Any]:
+        """Load audio file using librosa."""
+        print(f"Loading audio file: {audio_path}")
+
+        # Load audio with librosa (automatically handles various formats)
+        audio_array, sample_rate = librosa.load(audio_path, sr=16000)  # Whisper expects 16kHz
+
+        return {
+            "array": audio_array,
+            "sampling_rate": sample_rate,
+            "path": audio_path
         }
 
-        # Run transcription with progress tracking
-        segment_list, info = transcribe_with_progress(
-            model,
-            audio_for_transcription,
-            progress_tracker,
-            **transcription_params
-        )
+    def _convert_timestamps_to_srt(self, chunks: List[Dict], audio_duration: float) -> List[srt.Subtitle]:
+        """Convert Hugging Face pipeline timestamps to SRT format."""
+        subs = []
 
-        transcription_time = time.time() - start_time
+        print(f"Processing {len(chunks)} chunks...")
 
-        print(f"⏱️ Transcription completed in {transcription_time:.2f} seconds")
-        print(f"📊 Total segments processed: {len(segment_list)}")
+        for i, chunk in enumerate(chunks, start=1):
+            # Extract timestamp and text from chunk
+            timestamp = chunk.get("timestamp", [0.0, audio_duration])
+            text = chunk.get("text", "").strip()
 
-        # Calculate processing rate
-        audio_duration = get_audio_duration_fast(audio_for_transcription)
-        if audio_duration:
-            processing_rate = audio_duration / transcription_time
-            print(f"🚀 Processing rate: {processing_rate:.1f}x real-time")
+            if not text:
+                continue
 
-        # 6. Save Raw SRT (in Temp Folder)
-        raw_srt_path = os.path.join(TEMP_PATH, f"{file_basename}.raw.srt")
-        subs = [
-            srt.Subtitle(
+            # Handle timestamp format
+            if isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2:
+                start_time = float(timestamp[0]) if timestamp[0] is not None else 0.0
+                end_time = float(timestamp[1]) if timestamp[1] is not None else start_time + 1.0
+            else:
+                # If timestamp format is unexpected, create reasonable defaults
+                start_time = i * 2.0  # 2 seconds per segment as fallback
+                end_time = start_time + 2.0
+
+            # Ensure end_time is after start_time
+            if end_time <= start_time:
+                end_time = start_time + 1.0
+
+            sub = srt.Subtitle(
                 index=i,
-                start=timedelta(seconds=s.start),
-                end=timedelta(seconds=s.end),
-                content=s.text.strip()
-            ) for i, s in enumerate(segment_list, 1)
+                start=timedelta(seconds=start_time),
+                end=timedelta(seconds=end_time),
+                content=text
+            )
+            subs.append(sub)
+
+        return subs
+
+    def _check_ffmpeg(self) -> bool:
+        """Check if ffmpeg and ffprobe are available."""
+        ffmpeg_path = self.config["ffmpeg_path"]
+        ffprobe_path = self.config["ffprobe_path"]
+
+        if not (os.path.exists(ffmpeg_path) and os.path.exists(ffprobe_path)):
+            print(f"Warning: ffmpeg/ffprobe not found at specified location.")
+            print(f"Checking system PATH...")
+
+            # Check if they're in system PATH
+            try:
+                subprocess.run(["ffmpeg", "-version"], capture_output=True, check=True)
+                subprocess.run(["ffprobe", "-version"], capture_output=True, check=True)
+                self.config["ffmpeg_path"] = "ffmpeg"
+                self.config["ffprobe_path"] = "ffprobe"
+                return True
+            except (subprocess.CalledProcessError, FileNotFoundError):
+                print("Error: ffmpeg/ffprobe not found. Please install ffmpeg.")
+                return False
+        return True
+
+    def _convert_to_audio(self, video_path: str) -> tuple[str, bool]:
+        """Convert video file to audio format.
+
+        Returns:
+            tuple: (audio_path, is_temporary) - path to audio file and whether it should be cleaned up
+        """
+        if not self._check_ffmpeg():
+            raise RuntimeError("ffmpeg is required for video conversion")
+
+        video_name = Path(video_path).stem
+
+        # Choose output location based on config
+        if self.config.get("save_audio_to_export_location", True):
+            audio_path = os.path.join(self.config["audio_export"], f"{video_name}.mp3")
+            is_temporary = False  # Don't clean up if saving to audio_export
+            print(f"Converting video to audio (permanent): {video_path}")
+        else:
+            audio_path = os.path.join(self.config["temp_location"], f"{video_name}.mp3")
+            is_temporary = True  # Clean up temp files
+            print(f"Converting video to audio (temporary): {video_path}")
+
+        print(f"Output: {audio_path}")
+
+        cmd = [
+            self.config["ffmpeg_path"],
+            "-i", video_path,
+            "-vn",  # No video
+            "-acodec", "libmp3lame",
+            "-ab", "192k",  # Audio bitrate
+            "-ar", "22050",  # Audio sample rate
+            "-y",  # Overwrite output file
+            audio_path
         ]
 
-        with open(raw_srt_path, "w", encoding="utf-8") as f:
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, check=True)
+            print("Video conversion completed!")
+            return audio_path, is_temporary
+        except subprocess.CalledProcessError as e:
+            print(f"Error converting video: {e}")
+            print(f"FFmpeg output: {e.stderr}")
+            raise
+
+    def _clean_text(self, text: str) -> str:
+        """Clean up transcribed text."""
+        # Remove common garbage phrases
+        for garbage in GARBAGE_PATTERNS:
+            text = text.replace(garbage, "")
+
+        # Remove extra whitespace
+        text = re.sub(r'\s+', ' ', text).strip()
+
+        # Remove quotes
+        text = text.translate(REMOVE_QUOTES)
+
+        return text
+
+    def _clean_srt_segments(self, segments: List[srt.Subtitle]) -> List[srt.Subtitle]:
+        """Clean and filter SRT segments."""
+        cleaned_segments = []
+
+        for segment in segments:
+            # Clean the text
+            cleaned_text = self._clean_text(segment.content)
+
+            # Skip if text is too short or empty
+            if len(cleaned_text.strip()) < 3:
+                continue
+
+            # Skip if it's likely garbage
+            if any(garbage.lower() in cleaned_text.lower() for garbage in GARBAGE_PATTERNS):
+                continue
+
+            # Update the segment with cleaned text
+            segment.content = cleaned_text
+            cleaned_segments.append(segment)
+
+        # Renumber segments
+        for i, segment in enumerate(cleaned_segments, 1):
+            segment.index = i
+
+        return cleaned_segments
+
+    def _add_credit_to_srt(self, srt_path: str, credit: str):
+        """Add credit line to the end of SRT file."""
+        if not credit:
+            return
+
+        with open(srt_path, 'r', encoding='utf-8') as f:
+            subs = list(srt.parse(f.read()))
+
+        if subs:
+            # Add credit at the end
+            last_sub_end_time = subs[-1].end
+            credit_sub = srt.Subtitle(
+                index=len(subs) + 1,
+                start=last_sub_end_time,
+                end=last_sub_end_time + timedelta(seconds=2),
+                content=credit
+            )
+            subs.append(credit_sub)
+
+        with open(srt_path, 'w', encoding='utf-8') as f:
             f.write(srt.compose(subs))
-        print(f"📝 Raw transcription saved ({len(subs)} segments)")
 
-        # 7. Clean and Stamp Final SRT
-        print("\n--- Post-Processing ---")
-        lang_code = TARGET_LANGUAGE_CODE if TASK == "translate" else TO_LANGUAGE_CODE.get(source_lang, source_lang)
-        final_srt_filename = f"{file_basename}.{lang_code}.srt"
-        hallucination_lists = [SUPPRESS_HIGH, GARBAGE_LIST]
+    def transcribe_file(self, file_path: str) -> str:
+        """Main transcription function using Hugging Face pipeline."""
+        # Find the actual file path using our search logic
+        actual_file_path = self._find_input_file(file_path)
 
-        cleaned_srt_path = None
-        if TASK == "translate":
-            cleaned_srt_path = clean_srt_file_english(raw_srt_path, SRT_OUTPUT_PATH, final_srt_filename, hallucination_lists)
-        else:  # transcribe
-            if source_lang == "ja":  # Use validated language code
-                cleaned_srt_path = clean_srt_file_japanese(raw_srt_path, SRT_OUTPUT_PATH, final_srt_filename, hallucination_lists)
+        if not os.path.exists(actual_file_path):
+            raise FileNotFoundError(f"File not found: {actual_file_path}")
+
+        self._load_model()
+
+        # Determine file type and prepare audio file
+        audio_path = actual_file_path
+        temp_audio = False
+
+        if self._is_video_file(actual_file_path):
+            print("Video file detected, converting to audio...")
+            audio_path, temp_audio = self._convert_to_audio(actual_file_path)
+        elif not self._is_audio_file(actual_file_path):
+            raise ValueError(f"Unsupported file type: {Path(actual_file_path).suffix}")
+
+        try:
+            # Generate output filename based on original file
+            base_name = Path(actual_file_path).stem
+            srt_path = os.path.join(self.config["srt_location"], f"{base_name}.srt")
+
+            print(f"Transcribing: {audio_path}")
+            print(f"Output SRT: {srt_path}")
+            print(f"Using device: {self.device}")
+
+            # Debug: Check if method exists
+            print("DEBUG: Checking if _load_audio method exists...")
+            if hasattr(self, '_load_audio'):
+                print("DEBUG: _load_audio method found!")
             else:
-                cleaned_srt_path = clean_srt_file_english(raw_srt_path, SRT_OUTPUT_PATH, final_srt_filename, hallucination_lists)
+                print("DEBUG: _load_audio method NOT found! Available methods:")
+                methods = [method for method in dir(self) if not method.startswith('__')]
+                print(f"DEBUG: Available methods: {methods}")
 
-        if cleaned_srt_path and os.path.exists(cleaned_srt_path):
-            stamp_srt_file(cleaned_srt_path, CREDIT)
-
-            # Performance summary
-            total_time = time.time() - start_time
-            print(f"\n✨ --- Transcription Complete! --- ✨")
-            print(f"✅ Final SRT: {cleaned_srt_path}")
-            print(f"⏱️ Total processing time: {total_time:.2f} seconds")
-            print(f"🚀 Device used: {actual_device} ({actual_compute})")
-
-            if audio_duration:
-                overall_rate = audio_duration / total_time
-                print(f"📊 Overall processing rate: {overall_rate:.1f}x real-time")
-
-            if file_type == 'video':
-                print(f"🎵 Audio cached: {os.path.join(AUDIO_OUTPUT_PATH, f'{file_basename}.mp3')}")
-
-            if actual_device == "mps":
-                print("🎉 Successfully utilized Apple Silicon MPS acceleration!")
-        else:
-            print("\n⚠️ Warning: SRT cleaning failed. No final file was created.")
-
-    except Exception as e:
-        print(f"\n💥 An error occurred: {e}")
-        import traceback
-        traceback.print_exc()
-
-    finally:
-        # 8. Cleanup with better error handling
-        try:
-            if torch.backends.mps.is_available():
-                torch.mps.empty_cache()  # Clear MPS memory
-        except:
-            pass  # Ignore cleanup errors
-
-        try:
-            if 'model' in locals():
-                del model  # Explicitly delete model to free memory
-        except:
-            pass
-
-        if os.path.exists(TEMP_PATH):
+            # Load audio data - using inline implementation as fallback
+            print(f"Loading audio file: {audio_path}")
             try:
-                print(f"\n🧹 Cleaning up temporary folder: {TEMP_PATH}")
-                shutil.rmtree(TEMP_PATH)
-            except:
-                print("⚠️ Could not clean up temp folder (may be in use)")
+                # Load audio with librosa (automatically handles various formats)
+                audio_array, sample_rate = librosa.load(audio_path, sr=16000)  # Whisper expects 16kHz
+                audio_data = {
+                    "array": audio_array,
+                    "sampling_rate": sample_rate,
+                    "path": audio_path
+                }
+            except Exception as e:
+                print(f"Error loading audio: {e}")
+                raise
+            audio_duration = len(audio_data["array"]) / audio_data["sampling_rate"]
 
-if __name__ == "__main__":
-    # Apply early fixes
-    fix_openmp_conflicts()
+            print(f"Audio duration: {audio_duration:.2f} seconds")
 
-    # Display system info
-    print("🍎 Apple Silicon MPS-Optimized Whisper Transcription")
-    print("=" * 60)
+            # Run transcription with progress tracking
+            print("Starting transcription...")
+            with tqdm(total=100, desc="Transcribing") as pbar:
+                try:
+                    # Force translation to English regardless of source language
+                    result = self.pipe(
+                        audio_data["array"].copy(),
+                        return_timestamps=True,
+                        generate_kwargs={
+                            "task": "translate",  # Always translate to English
+                            "language": None  # Auto-detect source language
+                        }
+                    )
+                    pbar.update(100)
+                except Exception as e:
+                    print(f"Transcription error: {e}")
+                    # Fallback without explicit translation task
+                    result = self.pipe(
+                        audio_data["array"].copy(),
+                        return_timestamps=True
+                    )
+                    pbar.update(100)
 
-    if torch.backends.mps.is_available():
-        print("✅ MPS Support: Available")
+            # Extract chunks from result
+            chunks = result.get("chunks", [])
+            if not chunks:
+                print("Warning: No transcription chunks found")
+                # Create a single chunk with the full text if no chunks
+                chunks = [{
+                    "text": result.get("text", ""),
+                    "timestamp": [0.0, audio_duration]
+                }]
+
+            print(f"Generated {len(chunks)} transcription chunks")
+
+            # Convert to SRT format
+            subs = self._convert_timestamps_to_srt(chunks, audio_duration)
+
+            if not subs:
+                raise ValueError("No valid subtitles generated from transcription")
+
+            # Clean the segments
+            cleaned_subs = self._clean_srt_segments(subs)
+
+            if not cleaned_subs:
+                print("Warning: All segments were filtered out during cleaning")
+                cleaned_subs = subs  # Use original if cleaning removes everything
+
+            # Write SRT file
+            with open(srt_path, 'w', encoding='utf-8') as f:
+                f.write(srt.compose(cleaned_subs))
+
+            # Add credit
+            self._add_credit_to_srt(srt_path, self.config["credit"])
+
+            print(f"Transcription completed successfully!")
+            print(f"SRT file saved: {srt_path}")
+            print(f"Total segments: {len(cleaned_subs)}")
+
+            if not temp_audio:
+                print(f"Audio file saved permanently: {audio_path}")
+
+            return srt_path
+
+        finally:
+            # Clean up temporary audio file if created
+            if temp_audio and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                    print(f"Cleaned up temporary file: {audio_path}")
+                except OSError:
+                    print(f"Warning: Could not remove temporary file: {audio_path}")
+
+
+def load_config(config_file: str = "config.json") -> Dict[str, Any]:
+    """Load configuration from file if it exists, otherwise use embedded defaults."""
+    # First, use embedded configuration as base
+    config = CONFIG.copy()
+
+    # Try to load from external file if it exists (optional override)
+    if os.path.exists(config_file):
+        try:
+            with open(config_file, 'r') as f:
+                file_config = json.load(f)
+            # Merge with embedded config (file overrides embedded)
+            config.update(file_config)
+            print(f"Configuration loaded from: {config_file}")
+        except (json.JSONDecodeError, IOError) as e:
+            print(f"Warning: Could not load config file: {e}")
+            print("Using embedded configuration.")
     else:
-        print("⚠️ MPS Support: Not Available")
+        print("Using embedded configuration (no config.json found).")
 
-    print(f"🔧 PyTorch Version: {torch.__version__}")
-    print(f"🧠 CPU Threads: {torch.get_num_threads()}")
-    print(f"🔒 Offline Mode: {'Enabled' if FORCE_OFFLINE_MODE else 'Disabled'}")
-    print(f"📁 Model Cache: {MODEL_STORAGE_PATH}")
-    print("=" * 60)
+    return config
 
-    parser = argparse.ArgumentParser(
-        description="Apple Silicon optimized transcription with automatic file type detection and progress tracking",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-File Type Support:
-  📹 Video: .mp4, .mkv, .avi, .mov, .wmv, .flv, .webm, .m4v
-  🎵 Audio: .mp3, .wav, .flac, .m4a, .aac, .ogg, .wma
 
-Search Paths:
-  📁 Video files: VIDEO_SOURCE_PATH
-  🎵 Audio files: AUDIO_SOURCE_PATH
-  
-Audio Caching:
-  - Converted audio files are stored in AUDIO_OUTPUT_PATH
-  - Cached files are reused for faster processing on repeat runs
-  
-Progress Tracking Features:
-  - Real-time progress bars during video conversion
-  - Advanced progress tracking during transcription
-  - Processing rate and performance metrics
-  - Optimized for Apple Silicon M4 performance
-  
-Examples:
-  python transcribe.py video.mp4           # Convert video to audio, then transcribe
-  python transcribe.py audio.mp3           # Directly transcribe audio file
-  python transcribe.py "my file.mkv"       # Handle files with spaces
-  
-Performance Tips:
-  - Audio files process faster (no conversion step)
-  - Cached audio files from previous video conversions are reused
-  - Close memory-intensive applications for best MPS performance
-  - Progress bars show real-time processing speed and ETA
-        """
-    )
+def save_config(config: Dict[str, Any], config_file: str = "config.json"):
+    """Save configuration to file."""
+    try:
+        with open(config_file, 'w') as f:
+            json.dump(config, f, indent=2)
+        print(f"Configuration saved to: {config_file}")
+    except IOError as e:
+        print(f"Warning: Could not save config file: {e}")
 
-    parser.add_argument(
-        "filename",
-        type=str,
-        help="Video or audio file to process (searches in VIDEO_SOURCE_PATH and AUDIO_SOURCE_PATH)"
-    )
 
-    if len(sys.argv) == 1:
-        parser.print_help(sys.stderr)
+def main():
+    """Main function."""
+    if len(sys.argv) != 2:
+        print("Usage: python transcribe2.py [file]")
+        print("  file: Audio or video file to transcribe")
+        print("\nFile locations:")
+        print("  Audio files: place in audio_source directory")
+        print("  Video files: place in video_source directory")
+        print("  Converted audio: saved to audio_export directory")
         sys.exit(1)
 
-    args = parser.parse_args()
-    run_transcription_and_cleaning(args.filename)
+    input_file = sys.argv[1]
+
+    # Load configuration
+    config = load_config()
+
+    # Create transcriber and run
+    transcriber = WhisperTranscriber(config)
+
+    try:
+        result = transcriber.transcribe_file(input_file)
+        print(f"\n✅ Success! SRT file created: {result}")
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        sys.exit(1)
+
+
+if __name__ == "__main__":
+    main()
