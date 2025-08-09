@@ -1,8 +1,12 @@
 #!/usr/bin/env python3
 """
 Whisper Transcription Tool for Mac mini
-Converts video/audio files to English subtitles using faster-whisper
+Converts video/audio files to English subtitles using Whisper or faster-whisper
 Usage: python transcribe.py [file]
+
+Requirements:
+- For regular Whisper: pip install transformers torch librosa
+- For faster-whisper: pip install faster-whisper librosa
 """
 
 import os
@@ -16,19 +20,45 @@ from typing import List, Optional, Dict, Any
 import re
 import srt
 from datetime import timedelta
-from tqdm import tqdm
 import torch
-from transformers import pipeline
 import librosa
 import numpy as np
+import time
+import threading
+
+# Try to import psutil for CPU detection
+try:
+    import psutil
+
+    PSUTIL_AVAILABLE = True
+except ImportError:
+    PSUTIL_AVAILABLE = False
+    print("Note: Install psutil for automatic CPU thread detection: pip install psutil")
+
+# Try to import both whisper implementations
+try:
+    from transformers import pipeline
+
+    HF_AVAILABLE = True
+except ImportError:
+    HF_AVAILABLE = False
+    print("Warning: transformers not available. Install with: pip install transformers")
+
+try:
+    from faster_whisper import WhisperModel
+
+    FASTER_WHISPER_AVAILABLE = True
+except ImportError:
+    FASTER_WHISPER_AVAILABLE = False
+    print("Warning: faster-whisper not available. Install with: pip install faster-whisper")
 
 # Master Configuration - Embedded in script
 CONFIG = {
     "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
     "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
-    "mp3_source_location": "/Volumes/Macintosh HD/Downloads",  # Source MP3 files location
-    "mp4_source_location": "/Volumes/Macintosh HD/Downloads/mp4",  # Source MP4 files location
-    "mp3_exp_location": "/Volumes/Macintosh HD/Downloads/mp3/exported",  # Exported MP3 from MP4 conversion
+    "audio_source": "/Volumes/Macintosh HD/Downloads",  # Source audio files location
+    "video_source": "/Volumes/Macintosh HD/Downloads/video",  # Source video files location
+    "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",  # Exported audio from video conversion
     "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
     "ffmpeg_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffmpeg",
     "ffprobe_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffprobe",
@@ -38,7 +68,16 @@ CONFIG = {
     "chunk_duration": 15.0,
     "credit": "Created using Whisper Transcription Tool",
     "use_mps": True,  # Enable MPS acceleration on Apple Silicon
-    "save_mp3_to_exp_location": True  # Save converted MP3s to mp3_exp_location instead of temp
+    "save_audio_to_export_location": True,  # Save converted audio to audio_export instead of temp
+    "use_faster_whisper": True,  # Set to True to use faster-whisper, False for regular whisper
+    "faster_whisper_model_size": "large-v3",  # Model size for faster-whisper (different naming)
+    "faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--Systran--faster-whisper-large-v3",  # Local model folder name
+    "faster_whisper_compute_type": "float16",  # Compute type: float16, int8, int8_float16
+    "faster_whisper_device": "auto",  # Device: auto, cpu, cuda, or specific device
+    "faster_whisper_cpu_threads": "auto",  # Number of CPU threads: auto, or specific number (e.g., 4, 8)
+    "faster_whisper_num_workers": 1,  # Number of parallel workers for faster-whisper
+    "faster_whisper_beam_size": 5,  # Beam size for decoding (higher = more accurate but slower)
+    "faster_whisper_best_of": 5  # Number of candidates to consider (higher = more accurate but slower)
 }
 
 # Global constants
@@ -60,8 +99,21 @@ REMOVE_QUOTES = dict.fromkeys(map(ord, '"„"‟"＂「」'), None)
 class WhisperTranscriber:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.pipe = None
+        self.pipe = None  # For HF Transformers
+        self.model = None  # For faster-whisper
         self.device = None
+        self.use_faster_whisper = config.get("use_faster_whisper", False)
+
+        # Validate that the required library is available
+        if self.use_faster_whisper and not FASTER_WHISPER_AVAILABLE:
+            print("Error: faster-whisper requested but not installed.")
+            print("Install with: pip install faster-whisper")
+            sys.exit(1)
+        elif not self.use_faster_whisper and not HF_AVAILABLE:
+            print("Error: transformers requested but not installed.")
+            print("Install with: pip install transformers")
+            sys.exit(1)
+
         self._ensure_directories()
         self._setup_device()
 
@@ -70,29 +122,224 @@ class WhisperTranscriber:
         directories = [
             self.config["srt_location"],
             self.config["temp_location"],
-            self.config["mp3_source_location"],  # Source MP3 directory
-            self.config["mp4_source_location"],  # Source MP4 directory
-            self.config["mp3_exp_location"]  # Exported MP3 directory
+            self.config["audio_source"],
+            self.config["video_source"],
+            self.config["audio_export"],
+            self.config["whisper_models_location"]
         ]
         for path in directories:
             Path(path).mkdir(parents=True, exist_ok=True)
 
     def _setup_device(self):
         """Setup the best available device (MPS, CUDA, or CPU)."""
-        if self.config.get("use_mps", True) and torch.backends.mps.is_available():
-            self.device = torch.device("mps")
-            print("Using Apple Silicon MPS acceleration")
-        elif torch.cuda.is_available():
-            self.device = torch.device("cuda")
-            print("Using CUDA acceleration")
+        if self.use_faster_whisper:
+            # faster-whisper device setup
+            device_config = self.config.get("faster_whisper_device", "auto")
+            if device_config == "auto":
+                if torch.backends.mps.is_available() and self.config.get("use_mps", True):
+                    self.device = "cpu"  # faster-whisper doesn't support MPS directly, use CPU
+                    print("Using CPU for faster-whisper (MPS not supported by faster-whisper)")
+                elif torch.cuda.is_available():
+                    self.device = "cuda"
+                    print("Using CUDA for faster-whisper")
+                else:
+                    self.device = "cpu"
+                    print("Using CPU for faster-whisper")
+            else:
+                self.device = device_config
+                print(f"Using configured device for faster-whisper: {self.device}")
         else:
-            self.device = torch.device("cpu")
-            print("Using CPU (no acceleration available)")
+            # Regular whisper device setup
+            if self.config.get("use_mps", True) and torch.backends.mps.is_available():
+                self.device = torch.device("mps")
+                print("Using Apple Silicon MPS acceleration for Transformers Whisper")
+            elif torch.cuda.is_available():
+                self.device = torch.device("cuda")
+                print("Using CUDA acceleration for Transformers Whisper")
+            else:
+                self.device = torch.device("cpu")
+                print("Using CPU for Transformers Whisper")
+
+    def _check_model_exists(self) -> bool:
+        """Check if the Whisper model is already downloaded."""
+        cache_dir = self.config["whisper_models_location"]
+        model_name = self.config["model_size"].replace("/", "--")
+
+        # Check for common cached model directory patterns
+        potential_paths = [
+            os.path.join(cache_dir, "models--" + model_name),
+            os.path.join(cache_dir, model_name),
+            os.path.join(cache_dir, self.config["model_size"]),
+        ]
+
+        for path in potential_paths:
+            if os.path.exists(path) and os.listdir(path):
+                print(f"Found cached model at: {path}")
+                return True
+
+        return False
 
     def _load_model(self):
-        """Load the Whisper model using Hugging Face pipeline."""
+        """Load the appropriate Whisper model based on configuration."""
+        if self.use_faster_whisper:
+            self._load_faster_whisper_model()
+        else:
+            self._load_hf_model()
+
+    def _get_optimal_cpu_threads(self) -> int:
+        """Determine optimal number of CPU threads for faster-whisper."""
+        cpu_threads_config = self.config.get("faster_whisper_cpu_threads", "auto")
+
+        if cpu_threads_config == "auto":
+            if PSUTIL_AVAILABLE:
+                # Get system info using psutil
+                total_cores = psutil.cpu_count(logical=False)  # Physical cores
+                total_threads = psutil.cpu_count(logical=True)  # Logical cores (with hyperthreading)
+
+                # For M4, optimize based on performance/efficiency cores
+                # M4 typically has 4 performance cores + 6 efficiency cores
+                if total_cores >= 8:  # Likely M4 or similar
+                    # Use most cores but leave some for system
+                    optimal_threads = min(8, total_cores - 1)
+                elif total_cores >= 4:
+                    # Use most cores but leave one for system
+                    optimal_threads = total_cores - 1
+                else:
+                    # Use all available cores for smaller systems
+                    optimal_threads = total_cores
+
+                print(f"Auto-detected CPU: {total_cores} cores, {total_threads} threads")
+                print(f"Using {optimal_threads} threads for faster-whisper")
+                return optimal_threads
+            else:
+                # Fallback without psutil - use os.cpu_count()
+                import os
+                total_threads = os.cpu_count() or 4
+                optimal_threads = max(1, total_threads - 1)  # Leave one thread for system
+                print(f"Detected {total_threads} CPU threads (install psutil for better detection)")
+                print(f"Using {optimal_threads} threads for faster-whisper")
+                return optimal_threads
+        else:
+            # Use configured value
+            threads = int(cpu_threads_config)
+            print(f"Using configured {threads} threads for faster-whisper")
+            return threads
+
+    def _load_faster_whisper_model(self):
+        """Load the faster-whisper model with CPU thread optimization."""
+        if self.model is None:
+            model_size = self.config.get("faster_whisper_model_size", "large-v3")
+            compute_type = self.config.get("faster_whisper_compute_type", "float16")
+            num_workers = self.config.get("faster_whisper_num_workers", 1)
+            local_model_name = self.config.get("faster_whisper_local_model_path",
+                                               "models--Systran--faster-whisper-large-v3")
+
+            # Check if local model exists first
+            local_model_path = os.path.join(self.config["whisper_models_location"], local_model_name)
+
+            # Get optimal CPU threads
+            cpu_threads = self._get_optimal_cpu_threads()
+
+            # Determine which model to load
+            if os.path.exists(local_model_path):
+                print(f"✅ Found local faster-whisper model at: {local_model_path}")
+                model_path = local_model_path
+            else:
+                print(f"🔍 Local model not found, will download: {model_size}")
+                print(f"   Searched for: {local_model_path}")
+                model_path = model_size
+
+            print(f"Compute type: {compute_type}")
+            print(f"Device: {self.device}")
+            print(f"CPU threads: {cpu_threads}")
+            print(f"Workers: {num_workers}")
+
+            try:
+                print("🔄 Loading faster-whisper model...")
+                self.model = WhisperModel(
+                    model_path,
+                    device=self.device,
+                    compute_type=compute_type,
+                    download_root=self.config["whisper_models_location"],
+                    cpu_threads=cpu_threads,
+                    num_workers=num_workers
+                )
+                print("✅ faster-whisper model loaded successfully!")
+
+                # Verify model is actually loaded
+                if self.model is None:
+                    raise RuntimeError("Model loaded but is still None")
+
+            except Exception as e:
+                print(f"❌ Error loading faster-whisper model with optimizations: {e}")
+                print("🔄 Trying with basic settings...")
+
+                try:
+                    # Try with minimal settings
+                    self.model = WhisperModel(
+                        model_path,
+                        device="cpu",
+                        compute_type="int8"
+                    )
+                    print("✅ faster-whisper model loaded with basic settings!")
+
+                except Exception as basic_e:
+                    print(f"❌ Basic model loading also failed: {basic_e}")
+                    print("🔄 Trying fallback model...")
+
+                    try:
+                        # Last resort: try downloading base model
+                        self.model = WhisperModel(
+                            "base",
+                            device="cpu",
+                            compute_type="int8",
+                            download_root=self.config["whisper_models_location"]
+                        )
+                        print("✅ Fallback base model loaded!")
+                    except Exception as fallback_e:
+                        print(f"❌ All model loading attempts failed: {fallback_e}")
+                        raise RuntimeError(f"Could not load any faster-whisper model. Last error: {fallback_e}")
+
+        # Final verification
+        if self.model is None:
+            raise RuntimeError("Model is None after loading attempts")
+        """Load the faster-whisper model."""
+        if self.model is None:
+            model_size = self.config.get("faster_whisper_model_size", "large-v3")
+            compute_type = self.config.get("faster_whisper_compute_type", "float16")
+
+            print(f"Loading faster-whisper model: {model_size}")
+            print(f"Compute type: {compute_type}")
+            print(f"Device: {self.device}")
+
+            try:
+                self.model = WhisperModel(
+                    model_size,
+                    device=self.device,
+                    compute_type=compute_type,
+                    download_root=self.config["whisper_models_location"]
+                )
+                print("faster-whisper model loaded successfully!")
+            except Exception as e:
+                print(f"Error loading faster-whisper model: {e}")
+                print("Falling back to smaller model...")
+                self.model = WhisperModel(
+                    "base",
+                    device=self.device,
+                    compute_type=compute_type,
+                    download_root=self.config["whisper_models_location"]
+                )
+                print("Fallback faster-whisper model loaded successfully!")
+
+    def _load_hf_model(self):
+        """Load the Hugging Face Transformers Whisper model."""
         if self.pipe is None:
-            print(f"Loading Whisper model: {self.config['model_size']}")
+            # Check if model is already downloaded
+            model_exists = self._check_model_exists()
+            if model_exists:
+                print(f"Using cached HF Whisper model: {self.config['model_size']}")
+            else:
+                print(f"Downloading HF Whisper model: {self.config['model_size']}")
 
             # Set cache directory to our models location
             cache_dir = self.config["whisper_models_location"]
@@ -107,9 +354,9 @@ class WhisperTranscriber:
                     model_kwargs={"cache_dir": cache_dir},
                     return_timestamps=True
                 )
-                print("Model loaded successfully!")
+                print("HF Transformers Whisper model loaded successfully!")
             except Exception as e:
-                print(f"Error loading model: {e}")
+                print(f"Error loading HF model: {e}")
                 print("Falling back to smaller model...")
                 # Fallback to a smaller model if the large one fails
                 self.pipe = pipeline(
@@ -120,7 +367,25 @@ class WhisperTranscriber:
                     model_kwargs={"cache_dir": cache_dir},
                     return_timestamps=True
                 )
-                print("Fallback model loaded successfully!")
+                print("Fallback HF Transformers model loaded successfully!")
+
+    def _is_video_file_by_extension(self, extension: str) -> bool:
+        """Check if the file extension indicates a video file."""
+        video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
+        return extension.lower() in video_extensions
+
+    def _is_audio_file_by_extension(self, extension: str) -> bool:
+        """Check if the file extension indicates an audio file."""
+        audio_extensions = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.opus', '.flac'}
+        return extension.lower() in audio_extensions
+
+    def _is_video_file(self, file_path: str) -> bool:
+        """Check if the file is a video file."""
+        return self._is_video_file_by_extension(Path(file_path).suffix)
+
+    def _is_audio_file(self, file_path: str) -> bool:
+        """Check if the file is an audio file."""
+        return self._is_audio_file_by_extension(Path(file_path).suffix)
 
     def _find_input_file(self, filename: str) -> str:
         """Find the input file in the configured source directories.
@@ -145,16 +410,26 @@ class WhisperTranscriber:
         base_filename = os.path.basename(filename)
         print(f"Base filename: {base_filename}")
 
-        # Search in source directories - try both with and without leading slash
-        search_locations = [
-            self.config["mp3_source_location"],
-            self.config["mp4_source_location"],
-            self.config["mp3_exp_location"],
+        # Determine file type and search in appropriate directories
+        file_extension = Path(base_filename).suffix.lower()
+
+        # Define search locations based on file type
+        if self._is_audio_file_by_extension(file_extension):
+            primary_locations = [self.config["audio_source"], self.config["audio_export"]]
+            print(f"Audio file detected, searching in audio directories first")
+        elif self._is_video_file_by_extension(file_extension):
+            primary_locations = [self.config["video_source"]]
+            print(f"Video file detected, searching in video directories first")
+        else:
+            primary_locations = []
+            print(f"Unknown file type, searching in all directories")
+
+        # Build complete search list (primary locations first, then fallbacks)
+        search_locations = primary_locations + [
+            self.config["audio_source"],
+            self.config["video_source"],
+            self.config["audio_export"],
             os.getcwd(),  # Current working directory
-            # Also try without leading slash in case of path issues
-            self.config["mp3_source_location"].lstrip('/'),
-            self.config["mp4_source_location"].lstrip('/'),
-            self.config["mp3_exp_location"].lstrip('/'),
         ]
 
         # Remove duplicates while preserving order
@@ -186,10 +461,13 @@ class WhisperTranscriber:
             error_msg += f"  {i}. {potential_path} (dir exists: {exists})\n"
         error_msg += f"\nPlease check:\n"
         error_msg += f"1. File '{base_filename}' exists\n"
-        error_msg += f"2. File is in one of the above directories\n"
-        error_msg += f"3. File permissions allow reading\n"
+        error_msg += f"2. For audio files: place in {self.config['audio_source']}\n"
+        error_msg += f"3. For video files: place in {self.config['video_source']}\n"
+        error_msg += f"4. File permissions allow reading\n"
 
         raise FileNotFoundError(error_msg)
+
+    def _load_audio(self, audio_path: str) -> Dict[str, Any]:
         """Load audio file using librosa."""
         print(f"Loading audio file: {audio_path}")
 
@@ -260,21 +538,11 @@ class WhisperTranscriber:
                 return False
         return True
 
-    def _is_video_file(self, file_path: str) -> bool:
-        """Check if the file is a video file."""
-        video_extensions = {'.mp4', '.avi', '.mkv', '.mov', '.wmv', '.flv', '.webm', '.m4v'}
-        return Path(file_path).suffix.lower() in video_extensions
-
-    def _is_audio_file(self, file_path: str) -> bool:
-        """Check if the file is an audio file."""
-        audio_extensions = {'.mp3', '.wav', '.aac', '.m4a', '.ogg', '.opus', '.flac'}
-        return Path(file_path).suffix.lower() in audio_extensions
-
     def _convert_to_audio(self, video_path: str) -> tuple[str, bool]:
-        """Convert video file to MP3 audio.
+        """Convert video file to audio format.
 
         Returns:
-            tuple: (audio_path, is_temporary) - path to MP3 file and whether it should be cleaned up
+            tuple: (audio_path, is_temporary) - path to audio file and whether it should be cleaned up
         """
         if not self._check_ffmpeg():
             raise RuntimeError("ffmpeg is required for video conversion")
@@ -282,9 +550,9 @@ class WhisperTranscriber:
         video_name = Path(video_path).stem
 
         # Choose output location based on config
-        if self.config.get("save_mp3_to_exp_location", True):
-            audio_path = os.path.join(self.config["mp3_exp_location"], f"{video_name}.mp3")
-            is_temporary = False  # Don't clean up if saving to mp3_exp_location
+        if self.config.get("save_audio_to_export_location", True):
+            audio_path = os.path.join(self.config["audio_export"], f"{video_name}.mp3")
+            is_temporary = False  # Don't clean up if saving to audio_export
             print(f"Converting video to audio (permanent): {video_path}")
         else:
             audio_path = os.path.join(self.config["temp_location"], f"{video_name}.mp3")
@@ -353,7 +621,119 @@ class WhisperTranscriber:
 
         return cleaned_segments
 
-    def _add_credit_to_srt(self, srt_path: str, credit: str):
+    def _transcribe_with_faster_whisper(self, audio_data: Dict[str, Any], audio_duration: float) -> Dict[str, Any]:
+        """Transcribe using faster-whisper with progress tracking and optimized settings."""
+        # Verify model is loaded
+        if self.model is None:
+            raise RuntimeError("faster-whisper model is not loaded")
+
+        try:
+            # Get additional faster-whisper parameters
+            beam_size = self.config.get("faster_whisper_beam_size", 5)
+            best_of = self.config.get("faster_whisper_best_of", 5)
+
+            print(f"Transcription settings - Beam size: {beam_size}, Best of: {best_of}")
+            print(f"Model verification: {type(self.model)}")
+
+            # faster-whisper expects audio as numpy array
+            print("🔄 Starting faster-whisper transcription...")
+            segments_generator, info = self.model.transcribe(
+                audio_data["array"],
+                task="translate",  # Always translate to English
+                language=None,  # Auto-detect
+                beam_size=beam_size,
+                best_of=best_of,
+                vad_filter=True,  # Voice activity detection
+                vad_parameters=dict(min_silence_duration_ms=500)
+            )
+
+            print(f"📊 Detected language: {info.language} (probability: {info.language_probability:.2f})")
+            print(f"🔄 Processing segments...")
+
+            # Convert generator to list while tracking progress
+            chunks = []
+            last_end_time = 0.0
+            segment_count = 0
+
+            for segment in segments_generator:
+                segment_count += 1
+                chunks.append({
+                    "text": segment.text,
+                    "timestamp": [segment.start, segment.end]
+                })
+                last_end_time = segment.end
+
+                # Update progress based on audio processed
+                progress = min(100.0, (last_end_time / audio_duration) * 100) if audio_duration > 0 else 0
+                self._update_progress(progress)
+
+                # Print progress every 10 segments
+                if segment_count % 10 == 0:
+                    print(f"   Processed {segment_count} segments, {progress:.1f}% complete")
+
+            # Ensure we reach 100%
+            self._update_progress(100.0)
+
+            print(f"✅ Processed {segment_count} segments total")
+
+            # Create result in HF pipeline format
+            full_text = " ".join([chunk["text"] for chunk in chunks])
+            return {
+                "text": full_text,
+                "chunks": chunks
+            }
+
+        except Exception as e:
+            print(f"\n❌ faster-whisper transcription error: {e}")
+            print(f"   Model type: {type(self.model)}")
+            print(f"   Audio shape: {audio_data['array'].shape}")
+            print(f"   Audio duration: {audio_duration}")
+            raise
+
+    def _transcribe_with_hf(self, audio_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Transcribe using Hugging Face Transformers."""
+
+        # HF Transformers doesn't provide progress callbacks, so we simulate progress
+        def simulate_hf_progress():
+            # Simulate progress over expected duration (rough estimate)
+            estimated_duration = len(audio_data["array"]) / audio_data["sampling_rate"] * 0.3  # ~30% of audio duration
+            steps = 100
+            for i in range(steps + 1):
+                if hasattr(self, '_transcription_complete') and self._transcription_complete:
+                    break
+                progress = (i / steps) * 100
+                self._update_progress(progress)
+                time.sleep(estimated_duration / steps)
+
+        # Start progress simulation
+        progress_thread = threading.Thread(target=simulate_hf_progress)
+        progress_thread.daemon = True
+        progress_thread.start()
+
+        try:
+            # Force translation to English regardless of source language
+            result = self.pipe(
+                audio_data["array"].copy(),
+                return_timestamps=True,
+                generate_kwargs={
+                    "task": "translate",  # Always translate to English
+                    "language": None  # Auto-detect source language
+                }
+            )
+            self._transcription_complete = True
+            self._update_progress(100.0)
+            return result
+        except Exception as e:
+            print(f"\nHF Whisper transcription error: {e}")
+            print("Trying fallback without explicit translation task...")
+            # Fallback without explicit translation task
+            result = self.pipe(
+                audio_data["array"].copy(),
+                return_timestamps=True
+            )
+            self._transcription_complete = True
+            self._update_progress(100.0)
+            return result
         """Add credit line to the end of SRT file."""
         if not credit:
             return
@@ -377,31 +757,34 @@ class WhisperTranscriber:
 
     def transcribe_file(self, file_path: str) -> str:
         """Main transcription function using Hugging Face pipeline."""
-        if not os.path.exists(file_path):
-            raise FileNotFoundError(f"File not found: {file_path}")
+        # Find the actual file path using our search logic
+        actual_file_path = self._find_input_file(file_path)
+
+        if not os.path.exists(actual_file_path):
+            raise FileNotFoundError(f"File not found: {actual_file_path}")
 
         self._load_model()
 
         # Determine file type and prepare audio file
-        audio_path = file_path
+        audio_path = actual_file_path
         temp_audio = False
 
-        if self._is_video_file(file_path):
+        if self._is_video_file(actual_file_path):
             print("Video file detected, converting to audio...")
-            audio_path, temp_audio = self._convert_to_audio(file_path)
-        elif not self._is_audio_file(file_path):
-            raise ValueError(f"Unsupported file type: {Path(file_path).suffix}")
+            audio_path, temp_audio = self._convert_to_audio(actual_file_path)
+        elif not self._is_audio_file(actual_file_path):
+            raise ValueError(f"Unsupported file type: {Path(actual_file_path).suffix}")
 
         try:
-            # Generate output filename
-            base_name = Path(file_path).stem
+            # Generate output filename based on original file
+            base_name = Path(actual_file_path).stem
             srt_path = os.path.join(self.config["srt_location"], f"{base_name}.srt")
 
             print(f"Transcribing: {audio_path}")
             print(f"Output SRT: {srt_path}")
             print(f"Using device: {self.device}")
 
-            # Load audio data
+            # Load audio data using the _load_audio method
             audio_data = self._load_audio(audio_path)
             audio_duration = len(audio_data["array"]) / audio_data["sampling_rate"]
 
@@ -409,26 +792,53 @@ class WhisperTranscriber:
 
             # Run transcription with progress tracking
             print("Starting transcription...")
-            with tqdm(total=100, desc="Transcribing") as pbar:
-                try:
-                    # Force translation to English regardless of source language
-                    result = self.pipe(
-                        audio_data["array"].copy(),
-                        return_timestamps=True,
-                        generate_kwargs={
-                            "task": "translate",  # Always translate to English
-                            "language": None  # Auto-detect source language
-                        }
-                    )
-                    pbar.update(100)
-                except Exception as e:
-                    print(f"Transcription error: {e}")
-                    # Fallback without explicit translation task
-                    result = self.pipe(
-                        audio_data["array"].copy(),
-                        return_timestamps=True
-                    )
-                    pbar.update(100)
+            print("Note: This may take several minutes depending on audio length...")
+
+            # Create a progress indicator that shows elapsed time
+            import time
+            import threading
+
+            # Progress tracking variables
+            transcription_complete = False
+            start_time = time.time()
+
+            def show_progress():
+                while not transcription_complete:
+                    elapsed = time.time() - start_time
+                    mins, secs = divmod(elapsed, 60)
+                    print(f"\r⏳ Transcribing... Elapsed: {int(mins):02d}:{int(secs):02d} (GPU: 100% active)", end="",
+                          flush=True)
+                    time.sleep(1)
+
+            # Start progress thread
+            progress_thread = threading.Thread(target=show_progress)
+            progress_thread.daemon = True
+            progress_thread.start()
+
+            try:
+                # Force translation to English regardless of source language
+                result = self.pipe(
+                    audio_data["array"].copy(),
+                    return_timestamps=True,
+                    generate_kwargs={
+                        "task": "translate",  # Always translate to English
+                        "language": None  # Auto-detect source language
+                    }
+                )
+            except Exception as e:
+                print(f"\nTranscription error: {e}")
+                print("Trying fallback without explicit translation task...")
+                # Fallback without explicit translation task
+                result = self.pipe(
+                    audio_data["array"].copy(),
+                    return_timestamps=True
+                )
+            finally:
+                # Stop progress thread
+                transcription_complete = True
+                elapsed = time.time() - start_time
+                mins, secs = divmod(elapsed, 60)
+                print(f"\n✅ Transcription completed in {int(mins):02d}:{int(secs):02d}")
 
             # Extract chunks from result
             chunks = result.get("chunks", [])
@@ -467,7 +877,7 @@ class WhisperTranscriber:
             print(f"Total segments: {len(cleaned_subs)}")
 
             if not temp_audio:
-                print(f"MP3 file saved permanently: {audio_path}")
+                print(f"Audio file saved permanently: {audio_path}")
 
             return srt_path
 
@@ -518,12 +928,35 @@ def main():
     if len(sys.argv) != 2:
         print("Usage: python transcribe.py [file]")
         print("  file: Audio or video file to transcribe")
+        print("\nFile locations:")
+        print("  Audio files: place in audio_source directory")
+        print("  Video files: place in video_source directory")
+        print("  Converted audio: saved to audio_export directory")
+        print("\nConfiguration:")
+        print("  Set 'use_faster_whisper': true in config.json for faster processing")
+        print("  Set 'use_faster_whisper': false for HF Transformers (better MPS support)")
+        print("\nfaster-whisper CPU optimization:")
+        print("  'faster_whisper_cpu_threads': 'auto' (recommended for M4)")
+        print("  'faster_whisper_cpu_threads': 4 (use specific number of cores)")
+        print("  'faster_whisper_cpu_threads': 8 (use 8 cores - good for M4)")
+        print("\nRequirements:")
+        print("  For faster-whisper: pip install faster-whisper")
+        print("  For HF Transformers: pip install transformers torch")
+        print("  For CPU optimization: pip install psutil (optional)")
         sys.exit(1)
 
     input_file = sys.argv[1]
 
     # Load configuration
     config = load_config()
+
+    # Show which engine will be used
+    engine = "faster-whisper" if config.get("use_faster_whisper", False) else "HF Transformers Whisper"
+    print(f"🚀 Using {engine} for transcription")
+
+    if config.get("use_faster_whisper", False):
+        cpu_threads = config.get("faster_whisper_cpu_threads", "auto")
+        print(f"💻 CPU threads setting: {cpu_threads}")
 
     # Create transcriber and run
     transcriber = WhisperTranscriber(config)
