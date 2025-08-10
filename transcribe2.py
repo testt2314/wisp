@@ -59,53 +59,145 @@ except ImportError:
     print("Warning: faster-whisper not available. Install with: pip install faster-whisper")
 
 # Master Configuration - Optimized for speed and accuracy
+# CONFIG = {
+#     "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
+#     "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
+#     "audio_source": "/Volumes/Macintosh HD/Downloads",  # Source audio files location
+#     "video_source": "/Volumes/Macintosh HD/Downloads/video",  # Source video files location
+#     "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",  # Exported audio from video conversion
+#     "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
+#     "ffmpeg_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffmpeg",
+#     "ffprobe_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffprobe",
+#     "model_size": "openai/whisper-large-v3",
+#     "chunk_length_s": 30,
+#     "vad_threshold": 0.05,  # Much lower for soft voices (was 0.15)
+#     "chunk_duration": 15.0,
+#     "credit": "Created using Whisper Transcription Tool",
+#     "use_mps": True,  # Enable MPS acceleration on Apple Silicon
+#     "save_audio_to_export_location": True,  # Save converted audio to audio_export instead of temp
+#     "use_faster_whisper": True,  # Set to True to use faster-whisper, False for regular whisper
+#     "faster_whisper_model_size": "large-v3",  # Model size for faster-whisper (different naming)
+#     "faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/faster-whisper-large-v3",
+#     "faster_whisper_compute_type": "int8",  # Changed from float16 for M4 CPU compatibility
+#     "faster_whisper_device": "auto",  # Device: auto, cpu, cuda, or specific device
+#     "faster_whisper_cpu_threads":  8, # "auto",  # Number of CPU threads: auto, or specific number (e.g., 4, 8)
+#     "faster_whisper_num_workers": 1,  # Number of parallel workers for faster-whisper
+#     # Optimized settings to prevent repetition loops and improve speed
+#     "faster_whisper_beam_size": 1,  # Use greedy decoding for speed and to prevent loops
+#     "faster_whisper_best_of": 1,  # Single pass for speed
+#     "faster_whisper_temperature": [0.0, 0.2, 0.4],  # Temperature fallback to prevent loops
+#     "faster_whisper_patience": 1.0,  # Patience for beam search
+#     "faster_whisper_length_penalty": 1.0,  # Neutral length penalty
+#     "faster_whisper_repetition_penalty": 1.2,  # Strong penalty for repetitions
+#     "faster_whisper_no_repeat_ngram_size": 4,  # Prevent 4-gram repetitions
+#     "faster_whisper_suppress_blank": True,  # Suppress blank outputs
+#     "faster_whisper_suppress_tokens": [-1],  # Suppress specific tokens
+#     "faster_whisper_without_timestamps": False,  # Keep timestamps
+#     "faster_whisper_max_initial_timestamp": 1.0,  # Allow some initial timestamp flexibility
+#     "faster_whisper_word_timestamps": False,  # Disable word timestamps for speed
+#     "faster_whisper_prepend_punctuations": "\"'([{-",  # Punctuation handling
+#     "faster_whisper_append_punctuations": "\"'.,:!?)]}",  # Punctuation handling
+#     # Optimized VAD settings for speed without losing accuracy
+#     "faster_whisper_vad_filter": True,  # Enable VAD
+#     "faster_whisper_vad_threshold": 0.5,  # Higher threshold for faster processing
+#     "faster_whisper_min_silence_duration_ms": 1000,  # Longer silence detection
+#     "faster_whisper_max_speech_duration_s": 30,  # Reasonable segment length
+#     "faster_whisper_min_speech_duration_ms": 250,  # Minimum speech duration
+#     # Minimal preprocessing for speed
+#     "audio_minimal_preprocessing": True,  # Use minimal preprocessing only
+#     "audio_keep_original_format": True,  # Don't convert MP3 to WAV unnecessarily
+# }
+
 CONFIG = {
     "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
     "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
     "audio_source": "/Volumes/Macintosh HD/Downloads",  # Source audio files location
-    "video_source": "/Volumes/Macintosh HD/Downloads/video",  # Source video files location
+    "video_source": "/Volumes/Macintosh HD/Downloads/Video/uc",  # Source video files location
     "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",  # Exported audio from video conversion
     "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
-    "ffmpeg_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffmpeg",
-    "ffprobe_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/ffprobe",
+    "ffmpeg_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
+    "ffprobe_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
     "model_size": "openai/whisper-large-v3",
     "chunk_length_s": 30,
-    "vad_threshold": 0.05,  # Much lower for soft voices (was 0.15)
-    "chunk_duration": 15.0,
+    "vad_threshold": 0.01,  # Much lower for soft voices (was 0.15)
+    # CHANGE from 0.05 to 0.01 - main VAD more sensitive
+    "chunk_duration": 10.0,  # CHANGED: Reduced from 15.0 for faster processing chunks
     "credit": "Created using Whisper Transcription Tool",
     "use_mps": True,  # Enable MPS acceleration on Apple Silicon
     "save_audio_to_export_location": True,  # Save converted audio to audio_export instead of temp
     "use_faster_whisper": True,  # Set to True to use faster-whisper, False for regular whisper
-    "faster_whisper_model_size": "large-v3",  # Model size for faster-whisper (different naming)
-    "faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/faster-whisper-large-v3",
-    "faster_whisper_compute_type": "int8",  # Changed from float16 for M4 CPU compatibility
-    "faster_whisper_device": "auto",  # Device: auto, cpu, cuda, or specific device
-    "faster_whisper_cpu_threads":  8, # "auto",  # Number of CPU threads: auto, or specific number (e.g., 4, 8)
-    "faster_whisper_num_workers": 1,  # Number of parallel workers for faster-whisper
-    # Optimized settings to prevent repetition loops and improve speed
-    "faster_whisper_beam_size": 1,  # Use greedy decoding for speed and to prevent loops
-    "faster_whisper_best_of": 1,  # Single pass for speed
-    "faster_whisper_temperature": [0.0, 0.2, 0.4],  # Temperature fallback to prevent loops
-    "faster_whisper_patience": 1.0,  # Patience for beam search
-    "faster_whisper_length_penalty": 1.0,  # Neutral length penalty
-    "faster_whisper_repetition_penalty": 1.2,  # Strong penalty for repetitions
-    "faster_whisper_no_repeat_ngram_size": 4,  # Prevent 4-gram repetitions
-    "faster_whisper_suppress_blank": True,  # Suppress blank outputs
-    "faster_whisper_suppress_tokens": [-1],  # Suppress specific tokens
-    "faster_whisper_without_timestamps": False,  # Keep timestamps
-    "faster_whisper_max_initial_timestamp": 1.0,  # Allow some initial timestamp flexibility
-    "faster_whisper_word_timestamps": False,  # Disable word timestamps for speed
-    "faster_whisper_prepend_punctuations": "\"'([{-",  # Punctuation handling
-    "faster_whisper_append_punctuations": "\"'.,:!?)]}",  # Punctuation handling
-    # Optimized VAD settings for speed without losing accuracy
-    "faster_whisper_vad_filter": True,  # Enable VAD
-    "faster_whisper_vad_threshold": 0.5,  # Higher threshold for faster processing
-    "faster_whisper_min_silence_duration_ms": 1000,  # Longer silence detection
-    "faster_whisper_max_speech_duration_s": 30,  # Reasonable segment length
-    "faster_whisper_min_speech_duration_ms": 250,  # Minimum speech duration
-    # Minimal preprocessing for speed
-    "audio_minimal_preprocessing": True,  # Use minimal preprocessing only
-    "audio_keep_original_format": True,  # Don't convert MP3 to WAV unnecessarily
+
+    # ==== SPEED OPTIMIZED faster-whisper settings ====
+
+    #"faster_whisper_model_size":  "large-v3",  # CHANGED: from "large-v3" - 3-4x speed boost with ~10% accuracy trade-off
+    #"faster_whisper_local_model_path":"/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--Systran--faster-whisper-large-v3",
+
+    "faster_whisper_model_size":  "medium",  # CHANGED: from "large-v3" - 3-4x speed boost with ~10% accuracy trade-off
+    "faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/faster-whisper-medium",
+
+    # CHANGED: Updated path for medium model
+    "faster_whisper_compute_type": "int8",  # UNCHANGED: Keep int8 for M4 CPU compatibility
+    "faster_whisper_device": "auto",  # UNCHANGED: Auto device selection
+    "faster_whisper_cpu_threads": 8,  # UNCHANGED: Your current setting
+    "faster_whisper_num_workers": 2,  # CHANGED: Increased from 1 for parallel processing
+
+    # ==== AGGRESSIVE SPEED SETTINGS ====
+    #"faster_whisper_beam_size": 1,  # UNCHANGED: Keep greedy decoding for max speed
+    #"faster_whisper_best_of": 1,  # UNCHANGED: Keep single pass
+    #"faster_whisper_temperature": [0.0, 0.1, 0.2],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
+    # CHANGE from [0.0] - add fallbacks for difficult audio
+    #"faster_whisper_patience": 0.5,  # CHANGED: Reduced from 1.0 for faster beam search
+
+    #this is the most accurate but took too long
+    #"faster_whisper_beam_size": 5,  # UNCHANGED: Keep greedy decoding for max speed
+    #"faster_whisper_best_of": 3,  # UNCHANGED: Keep single pass
+    #"faster_whisper_patience": 2,  # CHANGED: Reduced from 1.0 for faster beam search
+    #"faster_whisper_temperature": [0.0, 0.2, 0.4, 0.6, 0.8],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
+
+    #this is the not so accurate but took too long
+    #"faster_whisper_beam_size": 3,  # UNCHANGED: Keep greedy decoding for max speed
+    #"faster_whisper_best_of": 2,  # UNCHANGED: Keep single pass
+    #"faster_whisper_patience": 1.5,  # CHANGED: Reduced from 1.0 for faster beam search
+    #"faster_whisper_temperature": [0.0, 0.2, 0.4],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
+
+    # this is the most accurate but took too long
+    "faster_whisper_beam_size": 2,  # UNCHANGED: Keep greedy decoding for max speed
+    "faster_whisper_best_of": 2,  # UNCHANGED: Keep single pass
+    "faster_whisper_patience": 1,  # CHANGED: Reduced from 1.0 for faster beam search
+    "faster_whisper_temperature": [0.0, 0.2],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
+
+    "faster_whisper_length_penalty": 0.8,  # CHANGED: from 1.0 - slight preference for shorter outputs
+    "faster_whisper_repetition_penalty": 1.3,  # CHANGED: Increased from 1.2 to reduce repetition issues
+    "faster_whisper_no_repeat_ngram_size": 3,  # CHANGED: Reduced from 4 for speed while still preventing repetition
+    "faster_whisper_suppress_blank": False,  # UNCHANGED: Suppress blank outputs
+    # CHANGE from True - don't suppress potential whispers
+    "faster_whisper_suppress_tokens": [-1, 50257],  # CHANGED: Added 50257 (common repetition token) to original [-1]
+    "faster_whisper_without_timestamps": False,  # UNCHANGED: Keep timestamps
+    "faster_whisper_max_initial_timestamp": 2.0,  # CHANGED: Reduced from 1.0 for faster initial processing
+    # CHANGE from 0.5 - allow more initial silence
+    "faster_whisper_word_timestamps": False,  # UNCHANGED: Disabled for speed
+    "faster_whisper_prepend_punctuations": "\"'([{-",  # UNCHANGED: Punctuation handling
+    "faster_whisper_append_punctuations": "\"'.,:!?)]}",  # UNCHANGED: Punctuation handling
+
+    # ==== AGGRESSIVE VAD SETTINGS FOR SPEED ====
+    "faster_whisper_vad_filter": True,  # UNCHANGED: Enable VAD
+    "faster_whisper_vad_threshold": 0.2, # CHANGE from 0.6 to 0.2 - much more sensitive to whispering
+    "faster_whisper_min_silence_duration_ms": 2000,  # CHANGED: Reduced from 1000 - faster silence detection
+    # CHANGE from 500 to 2000 - don't cut between soft words
+    "faster_whisper_max_speech_duration_s": 20,  # CHANGED: Reduced from 30 - shorter segments for faster processing
+    "faster_whisper_min_speech_duration_ms": 50,  # CHANGED: Reduced from 250 - catch shorter speech segments
+     # CHANGE from 100 to 50 - catch very short whispers
+
+    # ==== AUDIO PROCESSING OPTIMIZATIONS ====
+    "audio_minimal_preprocessing": False,  # UNCHANGED: Use minimal preprocessing only
+    # CHANGE from True - enable audio boosting for quiet speech
+
+    "audio_keep_original_format": True,  # UNCHANGED: Don't convert MP3 to WAV unnecessarily
+
+    #Japanese - to - English specific settings
+    "faster_whisper_force_language": "ja",  # Set to "ja" for Japanese, None for auto-detect
+    "faster_whisper_initial_prompt": "This is a Japanese conversation being translated to English.",
+    "faster_whisper_task": "translate",  # "transcribe" or "translate"
 }
 
 # Global constants
@@ -742,8 +834,11 @@ class WhisperTranscriber:
 
             segments_generator, info = self.model.transcribe(
                 audio_data["array"],
-                task="translate",
-                language=None,
+                #task="translate",
+                task=self.config.get("faster_whisper_task", "translate"),
+                #language=None,
+                language=self.config.get("faster_whisper_force_language", None),  # None for auto-detect, "ja" for Japanese
+                initial_prompt=self.config.get("faster_whisper_initial_prompt", None),
                 beam_size=beam_size,
                 best_of=self.config.get("faster_whisper_best_of", 1),
                 temperature=temperature,
