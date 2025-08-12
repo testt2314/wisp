@@ -115,8 +115,8 @@ CONFIG = {
     "video_source": "/Volumes/Macintosh HD/Downloads/Video/uc",  # Source video files location
     "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",  # Exported audio from video conversion
     "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
-    "ffmpeg_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
-    "ffprobe_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
+    "ffmpeg_path": "/Volumes/250SSD/Library/Application Support/audacity/libs/ffmpeg",
+    "ffprobe_path": "/Volumes/250SSD/Library/Application Support/audacity/libs/ffprobe",
     "model_size": "openai/whisper-large-v3",
     "chunk_length_s": 30,
     "vad_threshold": 0.01,  # Much lower for soft voices (was 0.15)
@@ -129,11 +129,11 @@ CONFIG = {
 
     # ==== SPEED OPTIMIZED faster-whisper settings ====
 
-    #"faster_whisper_model_size":  "large-v3",  # CHANGED: from "large-v3" - 3-4x speed boost with ~10% accuracy trade-off
-    #"faster_whisper_local_model_path":"/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--Systran--faster-whisper-large-v3",
+    "faster_whisper_model_size":  "large-v3",  # CHANGED: from "large-v3" - 3-4x speed boost with ~10% accuracy trade-off
+    "faster_whisper_local_model_path":"/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--Systran--faster-whisper-large-v3",
 
-    "faster_whisper_model_size":  "medium",  # CHANGED: from "large-v3" - 3-4x speed boost with ~10% accuracy trade-off
-    "faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/faster-whisper-medium",
+    #"faster_whisper_model_size":  "medium",  # CHANGED: from "large-v3" - 3-4x speed boost with ~10% accuracy trade-off
+    #"faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/faster-whisper-medium",
 
     # CHANGED: Updated path for medium model
     "faster_whisper_compute_type": "int8",  # UNCHANGED: Keep int8 for M4 CPU compatibility
@@ -155,16 +155,16 @@ CONFIG = {
     #"faster_whisper_temperature": [0.0, 0.2, 0.4, 0.6, 0.8],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
 
     #this is the not so accurate but took too long
-    #"faster_whisper_beam_size": 3,  # UNCHANGED: Keep greedy decoding for max speed
-    #"faster_whisper_best_of": 2,  # UNCHANGED: Keep single pass
-    #"faster_whisper_patience": 1.5,  # CHANGED: Reduced from 1.0 for faster beam search
-    #"faster_whisper_temperature": [0.0, 0.2, 0.4],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
-
-    # this is the most accurate but took too long
-    "faster_whisper_beam_size": 2,  # UNCHANGED: Keep greedy decoding for max speed
+    "faster_whisper_beam_size": 3,  # UNCHANGED: Keep greedy decoding for max speed
     "faster_whisper_best_of": 2,  # UNCHANGED: Keep single pass
-    "faster_whisper_patience": 1,  # CHANGED: Reduced from 1.0 for faster beam search
-    "faster_whisper_temperature": [0.0, 0.2],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
+    "faster_whisper_patience": 1.5,  # CHANGED: Reduced from 1.0 for faster beam search
+    "faster_whisper_temperature": [0.0, 0.2, 0.4],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
+
+    # alot of missing ...
+    #"faster_whisper_beam_size": 2,  # UNCHANGED: Keep greedy decoding for max speed
+    #"faster_whisper_best_of": 2,  # UNCHANGED: Keep single pass
+    #"faster_whisper_patience": 1,  # CHANGED: Reduced from 1.0 for faster beam search
+    #"faster_whisper_temperature": [0.0, 0.2],  # CHANGED: Single temperature, removed fallbacks [0.0, 0.2, 0.4] for speed
 
     "faster_whisper_length_penalty": 0.8,  # CHANGED: from 1.0 - slight preference for shorter outputs
     "faster_whisper_repetition_penalty": 1.3,  # CHANGED: Increased from 1.2 to reduce repetition issues
@@ -179,14 +179,20 @@ CONFIG = {
     "faster_whisper_prepend_punctuations": "\"'([{-",  # UNCHANGED: Punctuation handling
     "faster_whisper_append_punctuations": "\"'.,:!?)]}",  # UNCHANGED: Punctuation handling
 
+    # ==== AGGRESSIVE VAD SETTINGS FOR SPEED ====  -- too many errors
+    #"faster_whisper_vad_filter": False,  # UNCHANGED: Enable VAD
+    #"faster_whisper_vad_threshold": 0.2, # CHANGE from 0.6 to 0.2 - much more sensitive to whispering
+    #"faster_whisper_min_silence_duration_ms": 1500,  # CHANGED: Reduced from 1000 - faster silence detection
+    #"faster_whisper_max_speech_duration_s": 20,  # CHANGED: Reduced from 30 - shorter segments for faster processing
+    #"faster_whisper_min_speech_duration_ms": 50,  # CHANGED: Reduced from 250 - catch shorter speech segments
+
     # ==== AGGRESSIVE VAD SETTINGS FOR SPEED ====
-    "faster_whisper_vad_filter": True,  # UNCHANGED: Enable VAD
+    "faster_whisper_vad_filter": False,  # UNCHANGED: Enable VAD
     "faster_whisper_vad_threshold": 0.2, # CHANGE from 0.6 to 0.2 - much more sensitive to whispering
     "faster_whisper_min_silence_duration_ms": 2000,  # CHANGED: Reduced from 1000 - faster silence detection
     # CHANGE from 500 to 2000 - don't cut between soft words
     "faster_whisper_max_speech_duration_s": 20,  # CHANGED: Reduced from 30 - shorter segments for faster processing
     "faster_whisper_min_speech_duration_ms": 50,  # CHANGED: Reduced from 250 - catch shorter speech segments
-     # CHANGE from 100 to 50 - catch very short whispers
 
     # ==== AUDIO PROCESSING OPTIMIZATIONS ====
     "audio_minimal_preprocessing": False,  # UNCHANGED: Use minimal preprocessing only
@@ -211,6 +217,8 @@ GARBAGE_PATTERNS = [
     "Don't forget to like and subscribe.",
     "See you next time.",
     "Bye bye.",
+    "But"
+    "Okay"
 ]
 
 REMOVE_QUOTES = dict.fromkeys(map(ord, '"„"‟"＂「」'), None)
