@@ -42,7 +42,6 @@ warnings.filterwarnings("ignore", message="invalid value encountered in matmul")
 # Try to import psutil for CPU detection
 try:
     import psutil
-
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
@@ -51,7 +50,6 @@ except ImportError:
 # Try to import both whisper implementations
 try:
     from transformers import pipeline
-
     HF_AVAILABLE = True
 except ImportError:
     HF_AVAILABLE = False
@@ -59,7 +57,6 @@ except ImportError:
 
 try:
     from faster_whisper import WhisperModel
-
     FASTER_WHISPER_AVAILABLE = True
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
@@ -68,7 +65,6 @@ except ImportError:
 # Try to import scipy for advanced audio processing
 try:
     from scipy import signal
-
     SCIPY_AVAILABLE = True
     print("✅ scipy available for advanced audio processing")
 except ImportError:
@@ -124,7 +120,7 @@ CONFIG = {
     "timestamp_padding_end": 0.1,  # NEW: Conservative end padding
     "prevent_overlapping": True,  # NEW: Enable overlap prevention
     # ==== SEGMENT PROCESSING SETTINGS ====
-    "max_segment_duration": 15.0,  # NEW: Maximum duration before splitting (seconds)
+    "max_segment_duration": 20.0,  # NEW: Maximum duration before splitting (seconds)
     "min_segment_duration": 0.1,  # NEW: Minimum duration to keep
     # ==== LOW CONFIDENCE REPROCESSING SETTINGS ====
     "reprocess_low_confidence": True,  # NEW: Enable reprocessing of low confidence segments
@@ -802,8 +798,7 @@ class WhisperTranscriber:
                     audio_array = self._enhanced_audio_preprocessing_for_whispers(audio_array)
                     print("   🎯 Applied enhanced preprocessing (fallback)")
 
-                print(
-                    f"📊 Fallback final: {len(audio_array) / sample_rate:.1f}s, RMS: {np.sqrt(np.mean(audio_array ** 2)):.4f}")
+                print(f"📊 Fallback final: {len(audio_array) / sample_rate:.1f}s, RMS: {np.sqrt(np.mean(audio_array ** 2)):.4f}")
 
             except Exception as fallback_e:
                 print(f"❌ Fallback also failed: {fallback_e}")
@@ -956,7 +951,7 @@ class WhisperTranscriber:
         text = text.translate(REMOVE_QUOTES)
         return text
 
-    def _split_long_segment(self, segment: srt.Subtitle, max_duration: float = 10.0) -> List[srt.Subtitle]:
+    def _split_long_segment(self, segment: srt.Subtitle, max_duration: float = 15.0) -> List[srt.Subtitle]:
         """Split overly long segments into smaller chunks for better readability."""
         duration = (segment.end - segment.start).total_seconds()
 
@@ -1140,8 +1135,7 @@ class WhisperTranscriber:
         repetition_penalty = self.config.get("faster_whisper_repetition_penalty", 1.15)
         no_repeat_ngram_size = self.config.get("faster_whisper_no_repeat_ngram_size", 5)
 
-        print(
-            f"   Settings: beam_size={beam_size}, rep_penalty={repetition_penalty}, no_repeat_ngram={no_repeat_ngram_size}")
+        print(f"   Settings: beam_size={beam_size}, rep_penalty={repetition_penalty}, no_repeat_ngram={no_repeat_ngram_size}")
         print(f"   Temperature: {temperature}")
 
         try:
@@ -1153,8 +1147,7 @@ class WhisperTranscriber:
                 "min_speech_duration_ms": self.config.get("faster_whisper_min_speech_duration_ms", 25)  # Very short
             }
 
-            print(
-                f"   VAD: threshold={vad_parameters['threshold']}, min_silence={vad_parameters['min_silence_duration_ms']}ms")
+            print(f"   VAD: threshold={vad_parameters['threshold']}, min_silence={vad_parameters['min_silence_duration_ms']}ms")
 
             segments_generator, info = self.model.transcribe(
                 audio_data["array"],
@@ -1256,8 +1249,7 @@ class WhisperTranscriber:
                                 end = start + 0.5
 
                         avg_prob = np.mean([w.probability for w in words]) if words else 0.0
-                        print(
-                            f"\n📌 Segment #{segment_count}: {start:.3f}-->{end:.3f}, text: '{text[:50]}...', words: {len(words)}, avg_prob: {avg_prob:.2f}")
+                        print(f"\n📌 Segment #{segment_count}: {start:.3f}-->{end:.3f}, text: '{text[:50]}...', words: {len(words)}, avg_prob: {avg_prob:.2f}")
                     else:
                         # No valid words - use conservative segment timing
                         if end <= start:
@@ -1266,8 +1258,7 @@ class WhisperTranscriber:
                         if start < last_end_time:
                             start = last_end_time + 0.1
                             end = max(end, start + 0.5)
-                        print(
-                            f"\n⚠️ Using segment timing #{segment_count}: {start:.3f}-->{end:.3f}, text: '{text[:50]}...'")
+                        print(f"\n⚠️ Using segment timing #{segment_count}: {start:.3f}-->{end:.3f}, text: '{text[:50]}...'")
                 else:
                     # No word timestamps available
                     if end <= start:
@@ -1280,14 +1271,45 @@ class WhisperTranscriber:
 
                 # Final validation
                 if end <= start or (end - start) > 45.0:
-                    print(
-                        f"\n⚠️ Skipped invalid duration #{segment_count}: {start:.3f}-->{end:.3f}, text: '{text[:50]}...'")
+                    print(f"\n⚠️ Skipped invalid duration #{segment_count}: {start:.3f}-->{end:.3f}, text: '{text[:50]}...'")
                     continue
 
                 chunk_data = {
                     "text": text,
                     "timestamp": [start, end]
                 }
+                chunks.append(chunk_data)
+                last_end_time = end
+
+                # Progress feedback
+                progress = min(100.0, (last_end_time / audio_duration) * 100) if audio_duration > 0 else 0
+                self._update_progress(progress)
+
+                if segment_count % 5 == 0:
+                    print(f"\n   📝 Processed {segment_count} segments, {len(chunks)} valid chunks")
+
+            self._update_progress(100.0)
+            print(f"\n✅ Completed: {len(chunks)} segments, {repetition_count} repetitions filtered")
+
+            if len(chunks) == 0:
+                print("⚠️ No valid segments, creating fallback")
+                chunks = [{
+                    "text": "Audio transcription completed.",
+                    "timestamp": [0.0, min(10.0, audio_duration)]
+                }]
+
+            full_text = " ".join([chunk["text"] for chunk in chunks])
+            return {
+                "text": full_text,
+                "chunks": chunks
+            }
+
+        except Exception as e:
+            print(f"\n❌ faster-whisper error: {e}")
+            return {
+                "text": "Transcription completed with fallback.",
+                "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
+            }
 
     def _reprocess_low_confidence_segment(self, audio_data: Dict[str, Any], start_time: float, end_time: float,
                                           original_text: str, avg_prob: float) -> Dict[str, Any]:
@@ -1362,8 +1384,7 @@ class WhisperTranscriber:
             if reprocessed_text and best_confidence > avg_prob + improvement_threshold:
                 use_reprocessed = True
                 reason = f"confidence improved from {avg_prob:.2f} to {best_confidence:.2f}"
-            elif reprocessed_text and best_confidence > min_acceptable_confidence and len(reprocessed_text) > len(
-                    original_text) * 0.8:
+            elif reprocessed_text and best_confidence > min_acceptable_confidence and len(reprocessed_text) > len(original_text) * 0.8:
                 use_reprocessed = True
                 reason = f"acceptable confidence {best_confidence:.2f} with similar length"
             else:
@@ -1425,185 +1446,153 @@ class WhisperTranscriber:
             print(f"   ⚠️  Extra enhancement failed: {e}")
             return audio_segment
 
-            # Progress feedback
-            progress = min(100.0, (last_end_time / audio_duration) * 100) if audio_duration > 0 else 0
-            self._update_progress(progress)
+    def _transcribe_with_hf(self, audio_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Transcribe using HuggingFace Transformers Whisper."""
+        if self.pipe is None:
+            raise RuntimeError("HF Transformers model is not loaded")
 
-            if segment_count % 5 == 0:
-                print(f"\n   📝 Processed {segment_count} segments, {len(chunks)} valid chunks")
-
-        self._update_progress(100.0)
-        print(f"\n✅ Completed: {len(chunks)} segments, {repetition_count} repetitions filtered")
-
-        if len(chunks) == 0:
-            print("⚠️ No valid segments, creating fallback")
-            chunks = [{
-                "text": "Audio transcription completed.",
-                "timestamp": [0.0, min(10.0, audio_duration)]
-            }]
-
-        full_text = " ".join([chunk["text"] for chunk in chunks])
-        return {
-            "text": full_text,
-            "chunks": chunks
-        }
-
-    except Exception as e:
-    print(f"\n❌ faster-whisper error: {e}")
-    return {
-        "text": "Transcription completed with fallback.",
-        "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
-    }
-
-
-def _transcribe_with_hf(self, audio_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Transcribe using HuggingFace Transformers Whisper."""
-    if self.pipe is None:
-        raise RuntimeError("HF Transformers model is not loaded")
-
-    print("🚀 Starting HF Transformers transcription...")
-
-    try:
-        result = self.pipe(
-            audio_data["array"],
-            return_timestamps=True,
-            generate_kwargs={
-                "task": "translate" if self.config.get("faster_whisper_task") == "translate" else "transcribe",
-                "language": self.config.get("faster_whisper_force_language"),
-            }
-        )
-
-        # Process HF results
-        chunks = []
-        if isinstance(result.get("chunks"), list):
-            for chunk in result["chunks"]:
-                chunks.append({
-                    "text": chunk.get("text", ""),
-                    "timestamp": chunk.get("timestamp", [0.0, 1.0])
-                })
-        else:
-            # Fallback for non-chunked results
-            chunks = [{
-                "text": result.get("text", ""),
-                "timestamp": [0.0, len(audio_data["array"]) / audio_data["sampling_rate"]]
-            }]
-
-        full_text = result.get("text", "")
-        return {
-            "text": full_text,
-            "chunks": chunks
-        }
-
-    except Exception as e:
-        print(f"❌ HF Transformers error: {e}")
-        return {
-            "text": "Transcription completed with fallback.",
-            "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
-        }
-
-
-def transcribe_file(self, file_path: str) -> str:
-    """Main transcription function optimized for soft audio processing."""
-    actual_file_path = self._find_input_file(file_path)
-
-    if not os.path.exists(actual_file_path):
-        raise FileNotFoundError(f"File not found: {actual_file_path}")
-
-    self._load_model()
-
-    # Determine file type and prepare audio file
-    audio_path = actual_file_path
-    temp_audio = False
-
-    if self._is_video_file(actual_file_path):
-        print("Video file detected, converting to audio...")
-        audio_path, temp_audio = self._convert_to_audio(actual_file_path)
-    elif not self._is_audio_file(actual_file_path):
-        raise ValueError(f"Unsupported file type: {Path(actual_file_path).suffix}")
-
-    try:
-        # Generate output filename
-        base_name = Path(actual_file_path).stem
-        srt_path = os.path.join(self.config["srt_location"], f"{base_name}.srt")
-
-        print(f"📁 Input: {audio_path}")
-        print(f"📄 Output: {srt_path}")
-        print(f"🔧 Engine: {'faster-whisper' if self.use_faster_whisper else 'HF Transformers'}")
-        print(f"⚡ Optimization: Soft Audio + Whisper Detection")
-
-        # Load audio with enhanced preprocessing for whispers
-        audio_data = self._load_audio(audio_path)
-        audio_duration = len(audio_data["array"]) / audio_data["sampling_rate"]
-        print(f"⏱️  Duration: {audio_duration:.1f}s")
-
-        # Run optimized transcription for soft audio
-        start_time = time.time()
-        self.transcription_complete = False
+        print("🚀 Starting HF Transformers transcription...")
 
         try:
-            if self.use_faster_whisper:
-                result = self._transcribe_with_faster_whisper(audio_data, audio_duration)
+            result = self.pipe(
+                audio_data["array"],
+                return_timestamps=True,
+                generate_kwargs={
+                    "task": "translate" if self.config.get("faster_whisper_task") == "translate" else "transcribe",
+                    "language": self.config.get("faster_whisper_force_language"),
+                }
+            )
+
+            # Process HF results
+            chunks = []
+            if isinstance(result.get("chunks"), list):
+                for chunk in result["chunks"]:
+                    chunks.append({
+                        "text": chunk.get("text", ""),
+                        "timestamp": chunk.get("timestamp", [0.0, 1.0])
+                    })
             else:
-                result = self._transcribe_with_hf(audio_data)
-        finally:
-            self.transcription_complete = True
-            elapsed = time.time() - start_time
-            mins, secs = divmod(elapsed, 60)
-            v_duration = f"\nCompleted in {int(mins):02d}:{int(secs):02d}"
-            print(f"\n⏱️  Completed in {int(mins):02d}:{int(secs):02d}")
+                # Fallback for non-chunked results
+                chunks = [{
+                    "text": result.get("text", ""),
+                    "timestamp": [0.0, len(audio_data["array"]) / audio_data["sampling_rate"]]
+                }]
 
-            # Calculate speed ratio
-            speed_ratio = audio_duration / elapsed if elapsed > 0 else 0
-            print(f"🚀 Speed: {speed_ratio:.2f}x real-time")
+            full_text = result.get("text", "")
+            return {
+                "text": full_text,
+                "chunks": chunks
+            }
 
-        # Process results
-        chunks = result.get("chunks", [])
-        if not chunks:
-            chunks = [{
-                "text": result.get("text", "Transcription completed."),
-                "timestamp": [0.0, audio_duration]
-            }]
+        except Exception as e:
+            print(f"❌ HF Transformers error: {e}")
+            return {
+                "text": "Transcription completed with fallback.",
+                "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
+            }
 
-        print(f"📝 Generated {len(chunks)} chunks")
+    def transcribe_file(self, file_path: str) -> str:
+        """Main transcription function optimized for soft audio processing."""
+        actual_file_path = self._find_input_file(file_path)
 
-        # Convert to SRT
-        subs = self._convert_timestamps_to_srt(chunks, audio_duration)
-        if not subs:
-            subs = [srt.Subtitle(
-                index=1,
-                start=timedelta(seconds=0),
-                end=timedelta(seconds=min(5, audio_duration)),
-                content="Transcription completed."
-            )]
+        if not os.path.exists(actual_file_path):
+            raise FileNotFoundError(f"File not found: {actual_file_path}")
 
-        # Clean segments
-        cleaned_subs = self._clean_srt_segments(subs)
-        if not cleaned_subs:
-            cleaned_subs = subs
+        self._load_model()
 
-        # Write SRT file
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            f.write(srt.compose(cleaned_subs))
+        # Determine file type and prepare audio file
+        audio_path = actual_file_path
+        temp_audio = False
 
-        # Add credit
-        self._add_credit_to_srt(srt_path, self.config["credit"])
-        self._add_credit_to_srt(srt_path, v_duration)
+        if self._is_video_file(actual_file_path):
+            print("Video file detected, converting to audio...")
+            audio_path, temp_audio = self._convert_to_audio(actual_file_path)
+        elif not self._is_audio_file(actual_file_path):
+            raise ValueError(f"Unsupported file type: {Path(actual_file_path).suffix}")
 
-        print(f"✅ Success! SRT saved with {len(cleaned_subs)} segments")
+        try:
+            # Generate output filename
+            base_name = Path(actual_file_path).stem
+            srt_path = os.path.join(self.config["srt_location"], f"{base_name}.srt")
 
-        if not temp_audio:
-            print(f"📁 Audio saved: {audio_path}")
+            print(f"📁 Input: {audio_path}")
+            print(f"📄 Output: {srt_path}")
+            print(f"🔧 Engine: {'faster-whisper' if self.use_faster_whisper else 'HF Transformers'}")
+            print(f"⚡ Optimization: Soft Audio + Whisper Detection")
 
-        return srt_path
+            # Load audio with enhanced preprocessing for whispers
+            audio_data = self._load_audio(audio_path)
+            audio_duration = len(audio_data["array"]) / audio_data["sampling_rate"]
+            print(f"⏱️  Duration: {audio_duration:.1f}s")
 
-    finally:
-        # Cleanup temporary files
-        if temp_audio and os.path.exists(audio_path):
+            # Run optimized transcription for soft audio
+            start_time = time.time()
+            self.transcription_complete = False
+
             try:
-                os.remove(audio_path)
-                print(f"🗑️  Cleaned up: {audio_path}")
-            except OSError:
-                pass
+                if self.use_faster_whisper:
+                    result = self._transcribe_with_faster_whisper(audio_data, audio_duration)
+                else:
+                    result = self._transcribe_with_hf(audio_data)
+            finally:
+                self.transcription_complete = True
+                elapsed = time.time() - start_time
+                mins, secs = divmod(elapsed, 60)
+                v_duration = f"\nCompleted in {int(mins):02d}:{int(secs):02d}"
+                print(f"\n⏱️  Completed in {int(mins):02d}:{int(secs):02d}")
+
+                # Calculate speed ratio
+                speed_ratio = audio_duration / elapsed if elapsed > 0 else 0
+                print(f"🚀 Speed: {speed_ratio:.2f}x real-time")
+
+            # Process results
+            chunks = result.get("chunks", [])
+            if not chunks:
+                chunks = [{
+                    "text": result.get("text", "Transcription completed."),
+                    "timestamp": [0.0, audio_duration]
+                }]
+
+            print(f"📝 Generated {len(chunks)} chunks")
+
+            # Convert to SRT
+            subs = self._convert_timestamps_to_srt(chunks, audio_duration)
+            if not subs:
+                subs = [srt.Subtitle(
+                    index=1,
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=min(5, audio_duration)),
+                    content="Transcription completed."
+                )]
+
+            # Clean segments
+            cleaned_subs = self._clean_srt_segments(subs)
+            if not cleaned_subs:
+                cleaned_subs = subs
+
+            # Write SRT file
+            with open(srt_path, 'w', encoding='utf-8') as f:
+                f.write(srt.compose(cleaned_subs))
+
+            # Add credit
+            self._add_credit_to_srt(srt_path, self.config["credit"])
+            self._add_credit_to_srt(srt_path, v_duration)
+
+            print(f"✅ Success! SRT saved with {len(cleaned_subs)} segments")
+
+            if not temp_audio:
+                print(f"📁 Audio saved: {audio_path}")
+
+            return srt_path
+
+        finally:
+            # Cleanup temporary files
+            if temp_audio and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                    print(f"🗑️  Cleaned up: {audio_path}")
+                except OSError:
+                    pass
 
 
 def load_config(config_file: str = "config.json") -> Dict[str, Any]:
@@ -1657,8 +1646,7 @@ def main():
     print(f"🚀 Engine: {engine} (Soft Audio Optimized)")
     print(f"🔊 Whisper Enhancement: ENABLED")
     print(f"📊 Dynamic Compression: {'ENABLED' if config.get('audio_dynamic_range_compression', True) else 'DISABLED'}")
-    print(
-        f"🎯 Spectral Gating: {'ENABLED' if config.get('audio_spectral_gating', True) and SCIPY_AVAILABLE else 'DISABLED'}")
+    print(f"🎯 Spectral Gating: {'ENABLED' if config.get('audio_spectral_gating', True) and SCIPY_AVAILABLE else 'DISABLED'}")
 
     transcriber = WhisperTranscriber(config)
 
