@@ -64,6 +64,7 @@ except ImportError:
     HF_AVAILABLE = False
     print("Warning: transformers not available. Install with: pip install transformers")
 
+#Loading faster-whisper
 try:
     from faster_whisper import WhisperModel
 
@@ -72,16 +73,25 @@ except ImportError:
     FASTER_WHISPER_AVAILABLE = False
     print("Warning: faster-whisper not available. Install with: pip install faster-whisper")
 
+#Loading insanely-fast-whisper
 try:
-    from insanely_fast_whisper import pipeline as insanely_fast_pipeline
-    from transformers.utils import is_flash_attn_2_available
+    from insanely_fast_whisper.cli import pipeline as insanely_fast_pipeline
+    from insanely_fast_whisper.cli import main as insanely_fast_main
+
+    # Check if transformers is available for flash attention
+    try:
+        from transformers.utils import is_flash_attn_2_available
+
+        flash_attn_available = is_flash_attn_2_available()
+    except ImportError:
+        flash_attn_available = False
 
     INSANELY_FAST_WHISPER_AVAILABLE = True
-    print(f"✅ insanely-fast-whisper available (Flash Attention 2: {is_flash_attn_2_available()})")
-except ImportError:
-    INSANELY_FAST_WHISPER_AVAILABLE = False
-    print("Warning: insanely-fast-whisper not available. Install with: pip install insanely-fast-whisper")
+    print(f"✅ insanely-fast-whisper available via CLI (Flash Attention 2: {flash_attn_available})")
 
+except ImportError as e:
+    INSANELY_FAST_WHISPER_AVAILABLE = False
+    print(f"Warning: insanely-fast-whisper CLI not available. Error: {e}")
 
 # Try to import scipy for advanced audio processing
 try:
@@ -861,16 +871,18 @@ class WhisperTranscriber:
             sys.exit(1)
 
     def _load_insanely_fast_model(self):
-        """Load the insanely-fast-whisper model with MPS support."""
-        if self.pipe: return
-        model_name = self.config.get('insanely_fast_model_size', 'openai/whisper-large-v3')
+        """Load the insanely-fast-whisper model using the CLI pipeline function."""
+        if self.pipe:
+            return
+
+        model_name = self.config.get('insanely_fast_model_size', 'openai/whisper-medium')
         torch_dtype_str = self.config.get("insanely_fast_torch_dtype", "float16")
-        torch_dtype = getattr(torch, torch_dtype_str)
+        batch_size = self.config.get("insanely_fast_batch_size", 8)
 
-        print(f"Loading insanely-fast-whisper model: {model_name}")
-        print(f"Device: {self.device}, Dtype: {torch_dtype_str}")
+        print(f"Loading insanely-fast-whisper: {model_name}")
+        print(f"Device: {self.device}, Dtype: {torch_dtype_str}, Batch size: {batch_size}")
 
-        # Determine the cache directory for the model. Prioritize the specific path.
+        # Determine the cache directory for the model
         cache_dir = self.config.get("insanely_fast_models_location") or self.config.get("whisper_models_location")
         print(f"Model cache location: {cache_dir}")
 
@@ -879,6 +891,11 @@ class WhisperTranscriber:
             os.makedirs(cache_dir, exist_ok=True)
 
         try:
+            # Convert torch_dtype string to actual torch dtype
+            import torch
+            torch_dtype = getattr(torch, torch_dtype_str) if hasattr(torch, torch_dtype_str) else torch.float16
+
+            # Use the pipeline function from CLI module
             self.pipe = insanely_fast_pipeline(
                 "automatic-speech-recognition",
                 model=model_name,
@@ -886,14 +903,29 @@ class WhisperTranscriber:
                 device=self.device,
                 model_kwargs={
                     "cache_dir": cache_dir,
-                    "attn_implementation": "flash_attention_2" if is_flash_attn_2_available() else "sdpa"
-                },
+                    "attn_implementation": "flash_attention_2" if flash_attn_available else "sdpa"
+                } if cache_dir else {},
             )
+
             print("✅ insanely-fast-whisper model loaded successfully!")
+
         except Exception as e:
             print(f"❌ Error loading insanely-fast-whisper model: {e}")
-            sys.exit(1)
+            print("Trying with minimal configuration...")
 
+            try:
+                # Fallback with minimal config
+                self.pipe = insanely_fast_pipeline(
+                    "automatic-speech-recognition",
+                    model=model_name,
+                    device=self.device,
+                )
+                print("✅ insanely-fast-whisper loaded with minimal config!")
+            except Exception as e2:
+                print(f"❌ Minimal config also failed: {e2}")
+                print("Switching to faster-whisper as fallback...")
+                self.engine = "faster-whisper"
+                self._load_faster_whisper_model()
 
     def _is_video_file_by_extension(self, extension: str) -> bool:
         """Check if the file extension indicates a video file."""
@@ -1236,42 +1268,241 @@ class WhisperTranscriber:
         return {"text": " ".join(c['text'] for c in chunks), "chunks": chunks}
 
     def _transcribe_with_hf_based_pipeline(self, audio_data: Dict[str, Any], audio_duration: float) -> Dict[str, Any]:
-        """Transcribe using a HuggingFace-style pipeline (either 'whisper' or 'insanely-fast-whisper')."""
-        if self.pipe is None: raise RuntimeError(f"{self.engine} model not loaded")
+        """Transcribe using insanely-fast-whisper or standard HF Whisper pipeline."""
+        if self.pipe is None:
+            raise RuntimeError(f"{self.engine} model not loaded")
+
         print(f"🚀 Starting {self.engine} transcription...")
-        generate_kwargs = {
-            "task": self.config.get("task", "translate"),
-            "language": self.config.get("language"),
-        }
-        # For insanely-fast-whisper, we can add a progress bar callback
-        def progress_callback(progress):
-            self._update_progress(progress * 100)
 
-        # insanely-fast-whisper supports a progress callback
-        if self.engine == "insanely-fast-whisper":
-             result = self.pipe(
-                audio_data["array"].copy(), # Pass a copy to avoid potential modification issues
-                batch_size=self.config.get("insanely_fast_batch_size", 8),
-                return_timestamps=True,
-                generate_kwargs=generate_kwargs,
-                chunk_length_s=30, # Fixed chunk length for this pipeline
-                stride_length_s=5,
-                progress_callback=progress_callback,
-            )
-        else: # Standard HF pipeline
-            result = self.pipe(
-                audio_data["array"].copy(),
-                return_timestamps=True,
-                generate_kwargs=generate_kwargs,
-            )
+        try:
+            # Prepare generation kwargs
+            generate_kwargs = {
+                "task": self.config.get("task", "transcribe"),  # Default to transcribe
+            }
 
-        self._update_progress(100.0) # Ensure it finishes at 100%
-        chunks = result.get("chunks", [])
-        if not chunks:
-             chunks = [{"text": result.get("text", ""), "timestamp": [0.0, audio_duration]}]
-        print(f"\n✅ Processing complete: {len(chunks)} valid segments")
-        return {"text": result.get("text", ""), "chunks": chunks}
+            # Only add language if specified (let model auto-detect if None)
+            language = self.config.get("language")
+            if language:
+                generate_kwargs["language"] = language
 
+            # Get batch size from config or default to 1
+            batch_size = self.config.get("batch_size", 1)
+
+            if self.engine == "insanely-fast-whisper":
+                # ===== INSANELY-FAST-WHISPER SPECIFIC HANDLING =====
+                import time
+                import threading
+
+                self.transcription_complete = False
+
+                # Simple progress monitoring for insanely-fast-whisper
+                def progress_monitor():
+                    start_time = time.time()
+                    while not self.transcription_complete:
+                        elapsed = time.time() - start_time
+                        estimated_progress = min(85.0, (elapsed / max(1, audio_duration * 0.05)) * 100)
+                        print(f"\r⏳ Transcription Progress: {estimated_progress:.1f}% | Elapsed: {elapsed:.1f}s",
+                              end="", flush=True)
+                        time.sleep(1.0)
+
+                progress_thread = threading.Thread(target=progress_monitor)
+                progress_thread.daemon = True
+                progress_thread.start()
+
+                try:
+                    # Ensure proper audio format - use the same preprocessing as your successful test
+                    audio_array = audio_data["array"].astype(np.float32)
+
+                    # Normalize if needed (but don't over-normalize)
+                    max_val = np.max(np.abs(audio_array))
+                    if max_val > 1.0:
+                        audio_array = audio_array / max_val
+                        print(f"\n   📊 Audio normalized (was {max_val:.3f}, now max 1.0)")
+
+                    print(f"\n🎯 Processing {audio_duration:.1f}s audio with insanely-fast-whisper...")
+                    print(f"   Audio shape: {audio_array.shape}, dtype: {audio_array.dtype}")
+                    print(f"   Audio range: [{np.min(audio_array):.3f}, {np.max(audio_array):.3f}]")
+
+                    # Use the EXACT same call pattern that worked in your test
+                    result = self.pipe(
+                        audio_array,  # Direct numpy array (this worked!)
+                        batch_size=batch_size,  # Use batch_size parameter
+                        return_timestamps=True,  # This worked in your test
+                        generate_kwargs=generate_kwargs,  # This worked in your test
+                        ignore_warning=True  # This was in your working test
+                    )
+
+                    print(f"\n✅ insanely-fast-whisper transcription completed!")
+                    print(f"   Result type: {type(result)}")
+                    if isinstance(result, dict):
+                        print(f"   Result keys: {list(result.keys())}")
+
+                except Exception as e:
+                    print(f"\n❌ insanely-fast-whisper failed: {e}")
+                    print("🔄 Trying with minimal parameters...")
+
+                    try:
+                        # Even more minimal call - just like the working test
+                        result = self.pipe(audio_array)
+                        print(f"   ✅ Minimal call succeeded! Result type: {type(result)}")
+                    except Exception as e2:
+                        print(f"❌ Minimal call also failed: {e2}")
+                        raise e2
+
+                finally:
+                    self.transcription_complete = True
+                    print()  # New line after progress
+
+            else:
+                # ===== STANDARD HF WHISPER PIPELINE HANDLING =====
+                print(f"🎯 Processing {audio_duration:.1f}s audio with standard HF Whisper pipeline...")
+
+                # Prepare audio for standard HF pipeline
+                audio_array = audio_data["array"].copy().astype(np.float32)
+
+                print(f"   Audio shape: {audio_array.shape}, dtype: {audio_array.dtype}")
+                print(f"   Audio range: [{np.min(audio_array):.3f}, {np.max(audio_array):.3f}]")
+
+                # Standard HF pipeline call with progress callback support
+                result = self.pipe(
+                    audio_array,
+                    return_timestamps=True,
+                    generate_kwargs=generate_kwargs,
+                    batch_size=batch_size
+                )
+
+                print(f"✅ Standard HF Whisper transcription completed!")
+                print(f"   Result type: {type(result)}")
+                if isinstance(result, dict):
+                    print(f"   Result keys: {list(result.keys())}")
+
+            self._update_progress(100.0)
+
+            # ===== COMMON RESULT PROCESSING FOR BOTH ENGINES =====
+            print(f"🔍 Processing result...")
+
+            # Both engines should return results with 'text' and 'chunks' keys
+            full_text = result.get("text", "").strip()
+            chunks = result.get("chunks", [])
+
+            print(f"   Full text: '{full_text[:100]}{'...' if len(full_text) > 100 else ''}'")
+            print(f"   Chunks: {len(chunks)} segments")
+
+            # Process chunks - handle both engines' chunk formats
+            valid_chunks = []
+
+            if chunks:
+                for i, chunk in enumerate(chunks):
+                    text = chunk.get("text", "").strip()
+
+                    if text:  # Only process non-empty text
+                        # Handle different timestamp formats between engines
+                        timestamp = chunk.get("timestamp", None)
+
+                        if timestamp is None:
+                            # No timestamp info
+                            start, end = 0.0, audio_duration
+                        elif isinstance(timestamp, (tuple, list)) and len(timestamp) >= 2:
+                            # insanely-fast-whisper format: (start, end) or [start, end]
+                            start = float(timestamp[0]) if timestamp[0] is not None else 0.0
+                            end = float(timestamp[1]) if timestamp[1] is not None else audio_duration
+                        elif isinstance(timestamp, dict):
+                            # Some engines use dict format: {"start": x, "end": y}
+                            start = float(timestamp.get("start", 0.0))
+                            end = float(timestamp.get("end", audio_duration))
+                        else:
+                            # Fallback
+                            start, end = 0.0, audio_duration
+
+                        # Ensure valid timestamps
+                        start = max(0.0, start)
+                        end = min(audio_duration, end if end > start else start + 1.0)
+
+                        valid_chunks.append({
+                            "text": text,
+                            "timestamp": [start, end]
+                        })
+
+                        if i == 0:  # Show first chunk for debugging
+                            print(f"   First chunk: text='{text}', timestamp=({start:.1f}, {end:.1f})")
+
+            # If no valid chunks but we have text, create one chunk
+            if not valid_chunks and full_text:
+                valid_chunks = [{
+                    "text": full_text,
+                    "timestamp": [0.0, audio_duration]
+                }]
+                print(f"   Created single chunk from full text")
+
+            # If still no chunks, create a minimal valid response
+            if not valid_chunks:
+                # Check if it's just a non-speech audio (like your sine wave test)
+                if full_text in ["", "!", ".", " "] or len(full_text.strip()) <= 2:
+                    valid_chunks = [{
+                        "text": "No clear speech detected in audio",
+                        "timestamp": [0.0, min(1.0, audio_duration)]
+                    }]
+                    full_text = "No clear speech detected in audio"
+                    print(f"   No speech detected (result was: '{result.get('text', '')}')")
+                else:
+                    valid_chunks = [{
+                        "text": full_text if full_text else "Audio processed - content unclear",
+                        "timestamp": [0.0, audio_duration]
+                    }]
+
+            # Rebuild full text from valid chunks
+            if valid_chunks:
+                full_text = " ".join(chunk["text"] for chunk in valid_chunks if chunk["text"].strip())
+
+            print(
+                f"✅ {self.engine} processing complete: {len(valid_chunks)} valid segments, {len(full_text)} characters")
+
+            return {
+                "text": full_text,
+                "chunks": valid_chunks
+            }
+
+        except Exception as e:
+            print(f"❌ Transcription failed with {self.engine}: {e}")
+            print(f"Error type: {type(e).__name__}")
+            import traceback
+            print(f"Full traceback: {traceback.format_exc()}")
+
+            # Provide specific suggestions based on error type and engine
+            error_str = str(e).lower()
+            if "out of range" in error_str or "conversion" in error_str or "dtype" in error_str:
+                print("💡 Data type issue detected. Suggestions:")
+                print("   - Check audio sample rate (should be 16000 Hz)")
+                print("   - Ensure audio is mono (single channel)")
+                print("   - Try converting audio to float32 format")
+                if self.engine == "insanely-fast-whisper":
+                    print("   - Try fallback to standard HF Whisper pipeline")
+
+            elif "out of memory" in error_str or "oom" in error_str:
+                print(f"💡 Memory issue with {self.engine}:")
+                print("   - Try batch_size=1")
+                print("   - Use a smaller model (e.g., whisper-tiny)")
+                if self.engine == "insanely-fast-whisper":
+                    print("   - Try switching to faster-whisper engine")
+
+            elif "device" in error_str or "mps" in error_str:
+                print(f"💡 Device issue with {self.engine}:")
+                print("   - Try device='cpu' instead of 'mps'")
+                print("   - Check if MPS is properly supported")
+
+            elif "model" in error_str:
+                print(f"💡 Model loading issue with {self.engine}:")
+                print("   - Try 'openai/whisper-tiny' model")
+                print("   - Check internet connection for model download")
+
+            # Return a basic result instead of crashing
+            return {
+                "text": f"{self.engine} transcription encountered errors - audio duration: {audio_duration:.1f}s",
+                "chunks": [{
+                    "text": f"Audio file processed with {self.engine} errors - manual review recommended",
+                    "timestamp": [0.0, min(3.0, audio_duration)]
+                }]
+            }
 
     def transcribe_file(self, file_path: str) -> str:
         """Main transcription function."""
