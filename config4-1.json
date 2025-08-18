@@ -1,0 +1,64 @@
+{
+  "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
+  "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
+  "audio_source": "/Volumes/Macintosh HD/Downloads",
+  "video_source": "/Volumes/Macintosh HD/Downloads/Video/1/Kashiwagi Fumika",
+  "audio_export": "/Volumes/Macintosh HD/Downloads/srt/audio/exported",
+  "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
+  "ffmpeg_path": "/Volumes/250SSD/Library/Application Support/audacity/libs/ffmpeg",
+  "ffprobe_path": "/Volumes/250SSD/Library/Application Support/audacity/libs/ffprobe",
+  "credit": "Created using Whisper Transcription Tool",
+  "save_audio_to_export_location": false,
+  "clean_audio": false,
+
+  "batch_folder": "/Volumes/Macintosh HD/Downloads/srt/batch_audio",
+  "batch_processed_folder": "/Volumes/Macintosh HD/Downloads/srt/batch_audio/processed",
+  "batch_failed_folder": "/Volumes/Macintosh HD/Downloads/srt/batch_audio/failed",
+  "batch_log_file": "/Volumes/Macintosh HD/Downloads/srt/batch_processing.log",
+  "batch_skip_existing_srt": true,
+  "batch_move_processed_files": true,
+  "batch_continue_on_error": true,
+
+  "transcription_engine": "insanely-fast-whisper",
+
+  "hf_model_size": "openai/whisper-medium",
+  "hf_chunk_length_s": 30,
+  "hf_use_mps": true,
+
+  "faster_whisper_model_size": "medium",
+  "faster_whisper_compute_type": "int8",
+  "faster_whisper_device": "cpu",
+  "faster_whisper_cpu_threads": 6,
+  "faster_whisper_beam_size": 5,
+  "faster_whisper_temperature": [0.0],
+  "faster_whisper_vad_filter": true,
+  "faster_whisper_vad_threshold": 0.02,
+  "faster_whisper_min_silence_duration_ms": 200,
+
+  "insanely_fast_model_size": "openai/whisper-medium",
+  "insanely_fast_device": "mps",
+  "insanely_fast_torch_dtype": "float16",
+  "insanely_fast_batch_size": 8,
+
+  "task": "translate",
+  "language": "ja",
+  "initial_prompt": null,
+
+  "enable_advanced_speech_detection": true,
+  "timestamp_validation_enabled": true,
+  "merge_close_segments": true,
+  "max_segment_gap_ms": 150,
+  "filter_background_noise": true,
+
+  "enable_confidence_filtering": false,
+  "word_confidence_threshold": 0.4,
+  "segment_confidence_threshold": 0.35,
+
+  "audio_minimal_preprocessing": false,
+  "enable_mp3_transcription_boost": true,
+  "mp3_boost_factor": 15.0,
+  "mp3_normalize_audio": true,
+  "mp3_target_rms": 0.25,
+  "whisper_boost_factor": 30.0,
+  "dynamic_compression_ratio": 6.0
+}
