@@ -1,4 +1,25 @@
 #!/usr/bin/env python3
+"""
+Whisper Transcription Tool for Mac mini - ENHANCED WITH ACCURATE TIMESTAMP DETECTION
+Fixes issue where subtitles appear during silence/background noise
+This is with batch processing
+Usage: python transcribe.py [file] [--batch=y|n]
+
+
+KEY IMPROVEMENTS FOR ACCURATE TIMESTAMPS:
+- Enhanced VAD (Voice Activity Detection) to ignore background noise
+- Audio energy analysis to detect actual speech vs silence
+- Conservative timestamp validation
+- Spectral analysis for speech detection
+- Word-level confidence filtering
+- Silence gap detection and removal
+
+Requirements:
+- For regular Whisper: pip install transformers torch librosa
+- For faster-whisper: pip install faster-whisper librosa scipy
+- THIS IS THE FINAL WORKING CODE BEFORE MOVE INTO BATCH PROCESSING
+"""
+
 import os
 import sys
 import json
@@ -50,6 +71,17 @@ except ImportError:
     FASTER_WHISPER_AVAILABLE = False
     print("Warning: faster-whisper not available. Install with: pip install faster-whisper")
 
+# NEW: Try to import Kotoba-whisper conversion utilities
+try:
+    from transformers import WhisperForConditionalGeneration, WhisperTokenizer, WhisperProcessor
+    import torch
+    KOTOBA_CONVERSION_AVAILABLE = True
+    print("✅ Kotoba-whisper conversion dependencies available")
+except ImportError:
+    KOTOBA_CONVERSION_AVAILABLE = False
+    print("Warning: Kotoba-whisper conversion dependencies not available")
+    print("Install with: pip install transformers torch")
+
 # Try to import scipy for advanced audio processing
 try:
     from scipy import signal
@@ -61,6 +93,121 @@ except ImportError:
     SCIPY_AVAILABLE = False
     print("⚠️  scipy not available. Install for better speech detection: pip install scipy")
 
+CONFIG = {
+    "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
+    "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
+    "audio_source": "/Volumes/Macintosh HD/Downloads",
+    "video_source": "/Volumes/Macintosh HD/Downloads/Video/uc",
+    "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",
+    "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
+    "ffmpeg_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
+    "ffprobe_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
+    "model_size": "openai/whisper-large-v3",
+    "chunk_length_s": 30,
+    "vad_threshold": 0.02,
+    "chunk_duration": 20.0,
+    "credit": "Created using Whisper Transcription Tool",
+    "use_mps": True,
+    "save_audio_to_export_location": True,
+    "use_faster_whisper": True,
+
+    # ==== BATCH PROCESSING SETTINGS ====
+    "batch_folder": "/Volumes/Macintosh HD/Downloads/batch_audio",
+    "batch_processed_folder": "/Volumes/Macintosh HD/Downloads/batch_audio/processed",
+    "batch_failed_folder": "/Volumes/Macintosh HD/Downloads/batch_audio/failed",
+    "batch_log_file": "/Volumes/Macintosh HD/Downloads/srt/batch_processing.log",
+    "batch_skip_existing_srt": True,
+    "batch_move_processed_files": True,
+    "batch_continue_on_error": True,
+
+    # ==== MODEL SETTINGS ====
+    "faster_whisper_model_size": "large-v3",
+    "faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--Systran--faster-whisper-large-v3",
+    "faster_whisper_compute_type": "int8_float16",
+    "faster_whisper_device": "auto",
+    "faster_whisper_cpu_threads": 8,
+    "faster_whisper_num_workers": 1,
+
+    # ==== KOTOBA-WHISPER SETTINGS - NEW ====
+    "use_kotoba_whisper": False,  # NEW: Enable Kotoba-whisper instead of faster-whisper
+    "kotoba_model_name": "kotoba-tech/kotoba-whisper-v1.0",  # NEW: Kotoba model name
+    "kotoba_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/kotoba-whisper-v1.0",
+    # NEW: Local path
+    "kotoba_to_faster_whisper_convert": True,  # NEW: Convert Kotoba to faster-whisper format
+    "kotoba_conversion_cache_dir": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/kotoba_converted",
+    # NEW: Conversion cache
+
+    # ==== TRANSCRIPTION QUALITY SETTINGS ====
+    "faster_whisper_beam_size": 5,
+    "faster_whisper_best_of": 2,
+    "faster_whisper_patience": 1.5,
+    "faster_whisper_temperature": [0.0, 0.2, 0.4, 0.6, 0.8],
+
+    # ==== ANTI-REPETITION SETTINGS ====
+    "faster_whisper_length_penalty": 1.0,
+    "faster_whisper_repetition_penalty": 1.15,
+    "faster_whisper_no_repeat_ngram_size": 5,
+    "faster_whisper_suppress_blank": False,
+    "faster_whisper_suppress_tokens": [-1],
+
+    # ==== ENHANCED VAD SETTINGS FOR ACCURATE SPEECH DETECTION ====
+    "faster_whisper_vad_filter": True,
+    "faster_whisper_vad_threshold": 0.15,  # INCREASED: More conservative to avoid false positives
+    "faster_whisper_min_silence_duration_ms": 500,  # INCREASED: Longer silence required
+    "faster_whisper_max_speech_duration_s": 30,  # REDUCED: Shorter segments
+    "faster_whisper_min_speech_duration_ms": 100,  # INCREASED: Minimum speech length
+
+    # ==== SPEECH DETECTION THRESHOLDS - NEW SECTION ====
+    "speech_energy_threshold": 0.008,  # Minimum energy for speech detection
+    "speech_spectral_centroid_min": 300,  # Minimum spectral centroid for speech (Hz)
+    "speech_spectral_centroid_max": 3500,  # Maximum spectral centroid for speech (Hz)
+    "speech_zero_crossing_rate_min": 0.01,  # Minimum ZCR for speech
+    "speech_zero_crossing_rate_max": 0.35,  # Maximum ZCR for speech
+    "word_confidence_threshold": 0.4,  # INCREASED: Higher confidence required
+    "segment_confidence_threshold": 0.35,  # INCREASED: Higher segment confidence
+    "enable_advanced_speech_detection": True,  # Enable spectral analysis
+    "conservative_timing_mode": True,  # Enable conservative timestamp validation
+
+    # ==== TIMESTAMP ACCURACY SETTINGS - NEW SECTION ====
+    "timestamp_validation_enabled": True,  # Validate timestamps against audio energy
+    "timestamp_energy_window_ms": 100,  # Window size for energy analysis (ms)
+    "timestamp_buffer_start_ms": 200,  # Buffer before actual speech start (ms)
+    "timestamp_buffer_end_ms": 100,  # Buffer after actual speech end (ms)
+    "silence_gap_threshold_ms": 800,  # Minimum gap to consider separate segments
+    "merge_close_segments": True,  # Merge segments separated by short gaps
+    "max_segment_gap_ms": 400,  # Maximum gap to merge segments
+
+    # ==== NOISE FILTERING SETTINGS ====
+    "filter_background_noise": True,  # Enable background noise detection
+    "background_noise_duration_threshold": 2.0,  # Min duration to consider background noise
+    "noise_to_speech_ratio_threshold": 0.3,  # Max ratio of noise energy to speech energy
+
+    # ==== JAPANESE TO ENGLISH ====
+    "faster_whisper_force_language": "ja",
+    "faster_whisper_initial_prompt": None,
+    "faster_whisper_task": "translate",
+
+    # ==== AUDIO PROCESSING ====
+    "audio_minimal_preprocessing": False,
+    "audio_keep_original_format": True,
+    "audio_whisper_boost_enabled": True,
+    "audio_dynamic_range_compression": True,
+    "audio_spectral_gating": True,
+
+    # ==== MP3 TRANSCRIPTION BOOST SETTINGS - NEW ====
+    "enable_mp3_transcription_boost": True,  # Enable MP3-specific boosting
+    "mp3_boost_factor": 8.0,  # Boost factor specifically for MP3 files
+    "mp3_normalize_audio": True,  # Normalize MP3 audio before transcription
+    "mp3_target_rms": 0.15,  # Target RMS level for MP3 normalization
+    "mp3_compression_boost": True,  # Apply compression for MP3
+    "mp3_high_freq_boost": True,  # Boost high frequencies for clarity
+
+    # ==== SOFT AUDIO DETECTION THRESHOLDS ====
+    "soft_audio_rms_threshold": 0.008,  # Slightly increased for MP3
+    "soft_audio_max_threshold": 0.025,  # Slightly increased for MP3
+    "whisper_boost_factor": 15.0,  # Increased from 12.0
+    "dynamic_compression_ratio": 4.0,
+}
 
 # Global constants
 v_config = "config3_1.json"
@@ -69,6 +216,20 @@ TQDM_FORMAT = "{desc}: {percentage:3.1f}% |{bar}| {n:.2f}/{total:.2f} [{elapsed}
 # Garbage patterns to remove from transcriptions
 GARBAGE_PATTERNS = [
     "Thank you.",
+    "Thanks for watching.",
+    "Please subscribe.",
+    "Don't forget to like and subscribe.",
+    "See you next time.",
+    "Bye bye.",
+    "[moan]",
+    "Mmm",
+    "Ahh",
+    "Uhh",
+    "♪",  # Music notes
+    "(music)",
+    "[music]",
+    "(background music)",
+    "[background music]"
 ]
 
 REMOVE_QUOTES = dict.fromkeys(map(ord, '"„"‟"＂「」'), None)
@@ -520,12 +681,23 @@ class WhisperTranscriber:
         self.model = None  # For faster-whisper
         self.device = None
         self.use_faster_whisper = config.get("use_faster_whisper", False)
-        self.use_kotoba_whisper = config.get("use_kotoba_whisper", False)  # NEW
+        self.use_kotoba_whisper = config.get("use_kotoba_whisper", False)  # NEW: Kotoba flag
         self.transcription_complete = False
         self.current_progress = 0.0
 
         # Initialize advanced speech detector
         self.speech_detector = AdvancedSpeechDetector(config)
+
+        # NEW: Validate Kotoba-whisper settings
+        if self.use_kotoba_whisper and not KOTOBA_CONVERSION_AVAILABLE:
+            print("Error: Kotoba-whisper requested but conversion dependencies not installed.")
+            print("Install with: pip install transformers torch")
+            sys.exit(1)
+
+        # NEW: Override faster-whisper if Kotoba is enabled
+        if self.use_kotoba_whisper:
+            self.use_faster_whisper = True  # Use faster-whisper engine with converted Kotoba model
+            print("🎌 Kotoba-whisper mode enabled - will convert to faster-whisper format")
 
         # Validate that the required library is available
         if self.use_faster_whisper and not FASTER_WHISPER_AVAILABLE:
@@ -540,122 +712,235 @@ class WhisperTranscriber:
         self._ensure_directories()
         self._setup_device()
 
-    def _get_model_info(self) -> Dict[str, str]:
-        """Get model information based on configuration."""
-        if self.use_kotoba_whisper:
-            return {
-                "model_name": self.config.get("kotoba_whisper_model_name", "kotoba-tech/kotoba-whisper-v1.0"),
-                "local_path": self.config.get("kotoba_whisper_local_path",
-                    "/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--kotoba-tech--kotoba-whisper-v1.0"),
-                "cache_pattern": "models--kotoba-tech--kotoba-whisper-v1.0",
-                "model_type": "kotoba-whisper"
-            }
-        else:
-            model_size = self.config.get("faster_whisper_model_size", "large-v3")
-            return {
-                "model_name": model_size,
-                "local_path": self.config.get("faster_whisper_local_model_path",
-                    f"/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--Systran--faster-whisper-{model_size}"),
-                "cache_pattern": f"models--Systran--faster-whisper-{model_size}",
-                "model_type": "faster-whisper"
-            }
-
-    def _download_model(self, model_info: Dict[str, str]) -> str:
-        """Download model and return the path - works for both standard and kotoba-whisper models."""
-        model_name = model_info["model_name"]
-        model_type = model_info["model_type"]
-
-        print(f"🔄 Downloading {model_type} model: {model_name}")
-        if model_type == "kotoba-whisper":
-            print(f"   📥 This is the first time using kotoba-whisper - downloading model...")
-            print(f"   🇯🇵 Kotoba-whisper is optimized for Japanese speech recognition")
-        print(f"   ⏳ This may take several minutes depending on your connection...")
+    def _transcribe_with_kotoba_wrapper(self, audio_data: Dict[str, Any], audio_duration: float) -> Dict[str, Any]:
+        """NEW: Transcribe using Kotoba-whisper via transformers pipeline (wrapper mode)."""
+        print("🎌 Starting Kotoba-whisper transcription (wrapper mode)...")
+        print(f"   📊 Audio duration: {audio_duration:.1f}s")
+        print(f"   📊 Audio shape: {audio_data['array'].shape}")
+        print(f"   📊 Audio dtype: {audio_data['array'].dtype}")
+        print(f"   📊 Audio sample rate: {audio_data['sampling_rate']}")
 
         try:
-            # Create temporary model instance to trigger download
-            # This works for both standard faster-whisper and kotoba-whisper models
-            temp_model = WhisperModel(
-                model_name,
-                device="cpu",
-                compute_type="int8",
-                download_root=self.config["whisper_models_location"]
-            )
+            # Validate audio data
+            if len(audio_data["array"]) == 0:
+                raise ValueError("Audio array is empty")
 
-            print(f"   ✅ {model_type} model download initiated successfully")
+            # Check if pipeline exists
+            if not hasattr(self, '_kotoba_pipeline') or self._kotoba_pipeline is None:
+                raise RuntimeError("Kotoba pipeline not loaded")
 
-            # Find downloaded model location
-            cache_dir = self.config["whisper_models_location"]
+            print("   ✅ Audio validation passed, starting transcription...")
 
-            # For kotoba-whisper, the cache pattern is different
-            if model_type == "kotoba-whisper":
-                possible_locations = [
-                    os.path.join(cache_dir, model_info["cache_pattern"]),
-                    os.path.join(cache_dir, "models--kotoba-tech--kotoba-whisper-v1.0"),
-                    os.path.join(cache_dir, "models--kotoba-tech--kotoba-whisper-v1_0"),  # Alternative naming
-                    os.path.join(cache_dir, model_name.replace("/", "--")),
-                    os.path.join(cache_dir, "kotoba-whisper-v1.0"),
-                    os.path.join(cache_dir, model_name.split("/")[-1]),
-                ]
+            # Method 1: Try with chunking and full parameters
+            try:
+                print("   🔄 Attempting Method 1: Full parameters with chunking...")
+
+                # Calculate appropriate max_new_tokens
+                estimated_tokens = min(400, max(50, int(audio_duration * 3)))
+                print(f"   📊 Estimated tokens needed: {estimated_tokens}")
+
+                result = self._kotoba_pipeline(
+                    audio_data["array"],
+                    return_timestamps=True,
+                    chunk_length_s=30,
+                    stride_length_s=5,
+                    generate_kwargs={
+                        "task": "translate",  # Force translate for now
+                        "language": "ja",  # Force Japanese
+                        "max_new_tokens": estimated_tokens,
+                        "do_sample": False,
+                        "num_beams": 2,  # Reduced beams
+                        "early_stopping": True,
+                    }
+                )
+
+                print("   ✅ Method 1 successful!")
+
+            except Exception as e1:
+                print(f"   ❌ Method 1 failed: {e1}")
+                print("   🔄 Attempting Method 2: Simplified parameters...")
+
+                # Method 2: Simplified approach
+                try:
+                    result = self._kotoba_pipeline(
+                        audio_data["array"],
+                        return_timestamps=True,
+                        chunk_length_s=20,  # Shorter chunks
+                        generate_kwargs={
+                            "task": "translate",
+                            "language": "ja",
+                            "max_new_tokens": 200,  # Much smaller
+                            "do_sample": False,
+                        }
+                    )
+                    print("   ✅ Method 2 successful!")
+
+                except Exception as e2:
+                    print(f"   ❌ Method 2 failed: {e2}")
+                    print("   🔄 Attempting Method 3: Minimal parameters...")
+
+                    # Method 3: Absolute minimal
+                    try:
+                        result = self._kotoba_pipeline(
+                            audio_data["array"],
+                            return_timestamps=True
+                        )
+                        print("   ✅ Method 3 successful!")
+
+                    except Exception as e3:
+                        print(f"   ❌ Method 3 failed: {e3}")
+                        print("   🔄 Attempting Method 4: No timestamps...")
+
+                        # Method 4: No timestamps at all
+                        try:
+                            result = self._kotoba_pipeline(audio_data["array"])
+                            print("   ✅ Method 4 successful (no timestamps)!")
+
+                        except Exception as e4:
+                            print(f"   ❌ All methods failed. Last error: {e4}")
+                            raise e4
+
+            # Debug: Print raw result structure
+            print(f"   📊 Result type: {type(result)}")
+            print(f"   📊 Result keys: {result.keys() if isinstance(result, dict) else 'Not a dict'}")
+
+            # Process the result
+            chunks = []
+            full_text = ""
+
+            # Handle different result formats
+            if isinstance(result, dict):
+                full_text = result.get("text", "").strip()
+                result_chunks = result.get("chunks", [])
+
+                print(f"   📊 Full text length: {len(full_text)}")
+                print(f"   📊 Number of chunks: {len(result_chunks) if result_chunks else 0}")
+                print(f"   📊 Full text preview: '{full_text[:100]}...'")
+
+                if result_chunks and isinstance(result_chunks, list):
+                    print("   🔄 Processing chunks...")
+
+                    for i, chunk in enumerate(result_chunks):
+                        try:
+                            text = chunk.get("text", "").strip() if isinstance(chunk, dict) else str(chunk).strip()
+
+                            if text and len(text) > 1:
+                                # Handle timestamps
+                                if isinstance(chunk, dict) and "timestamp" in chunk:
+                                    timestamp = chunk["timestamp"]
+                                    if isinstance(timestamp, (list, tuple)) and len(timestamp) >= 2:
+                                        start_time = float(timestamp[0]) if timestamp[0] is not None else i * 5.0
+                                        end_time = float(timestamp[1]) if timestamp[1] is not None else start_time + 5.0
+                                    else:
+                                        start_time = i * 5.0
+                                        end_time = start_time + 5.0
+                                else:
+                                    start_time = i * 5.0
+                                    end_time = start_time + 5.0
+
+                                # Ensure end time doesn't exceed audio duration
+                                end_time = min(end_time, audio_duration)
+
+                                # Skip very short segments
+                                if end_time - start_time < 0.1:
+                                    continue
+
+                                chunks.append({
+                                    "text": text,
+                                    "timestamp": [start_time, end_time]
+                                })
+
+                                print(f"   ✅ Chunk {len(chunks)}: {start_time:.1f}-{end_time:.1f}s, '{text[:50]}...'")
+
+                                # Update progress
+                                progress = ((i + 1) / len(result_chunks)) * 100
+                                self._update_progress(progress)
+
+                        except Exception as chunk_error:
+                            print(f"   ⚠️  Error processing chunk {i}: {chunk_error}")
+                            continue
+
+                # If no chunks were processed but we have full text, create one chunk
+                if not chunks and full_text:
+                    print("   🔄 No chunks processed, using full text...")
+                    chunks = [{
+                        "text": full_text,
+                        "timestamp": [0.0, audio_duration]
+                    }]
+                    print(f"   ✅ Created single chunk: '{full_text[:100]}...'")
+
             else:
-                # Standard faster-whisper locations
-                possible_locations = [
-                    os.path.join(cache_dir, model_info["cache_pattern"]),
-                    os.path.join(cache_dir, model_name.replace("/", "--")),
-                    os.path.join(cache_dir, model_name.split("/")[-1]),
-                ]
+                print(f"   ⚠️  Unexpected result format: {type(result)}")
+                full_text = str(result) if result else ""
+                chunks = [{
+                    "text": full_text,
+                    "timestamp": [0.0, audio_duration]
+                }] if full_text else []
 
-            print(f"   🔍 Searching for downloaded {model_type} model in cache...")
+            self._update_progress(100.0)
 
-            for location in possible_locations:
-                print(f"   📁 Checking: {location}")
+            # Final validation
+            if not chunks:
+                print("   ⚠️  No chunks created, creating fallback...")
+                chunks = [{
+                    "text": full_text or "Kotoba transcription completed but no text detected.",
+                    "timestamp": [0.0, min(10.0, audio_duration)]
+                }]
 
-                if os.path.exists(location):
-                    print(f"   ✅ Found directory: {location}")
+            print(f"✅ Kotoba transcription complete!")
+            print(f"   📊 Final chunks: {len(chunks)}")
+            print(f"   📊 Total text length: {len(full_text)} characters")
 
-                    # First check if model files exist directly in this location
-                    if self._check_model_files_exist(location):
-                        print(f"✅ {model_type} model ready at: {location}")
-                        return location
-
-                    # Check snapshots subdirectory (common for HuggingFace models)
-                    snapshots_path = os.path.join(location, "snapshots")
-                    if os.path.exists(snapshots_path):
-                        print(f"   📂 Checking snapshots directory: {snapshots_path}")
-                        snapshots = [d for d in os.listdir(snapshots_path) if
-                                     os.path.isdir(os.path.join(snapshots_path, d))]
-
-                        if snapshots:
-                            # Use the most recent snapshot (last in sorted list)
-                            snapshots.sort()
-                            snapshot_path = os.path.join(snapshots_path, snapshots[-1])
-                            print(f"   📋 Using snapshot: {snapshots[-1]}")
-
-                            if self._check_model_files_exist(snapshot_path):
-                                print(f"✅ {model_type} model ready at: {snapshot_path}")
-                                return snapshot_path
-                else:
-                    print(f"   ❌ Not found: {location}")
-
-            # If we can't find the downloaded model, try to use the model name directly
-            # faster-whisper will handle the model loading internally
-            print(f"⚠️  {model_type} model downloaded but specific location not found")
-            print(f"   💡 Using model name directly - faster-whisper will handle internally")
-            return model_name
+            return {
+                "text": full_text or " ".join([chunk["text"] for chunk in chunks]),
+                "chunks": chunks
+            }
 
         except Exception as e:
-            print(f"❌ {model_type} download failed: {e}")
-            print(f"   💡 This could be due to:")
-            print(f"      • Network connectivity issues")
-            print(f"      • Insufficient disk space")
-            print(f"      • Model repository access issues")
+            print(f"❌ Kotoba wrapper critical error: {e}")
+            print(f"   Error type: {type(e).__name__}")
+            print(f"   Error details: {str(e)}")
 
-            if model_type == "kotoba-whisper":
-                print(f"   🔄 Falling back to standard faster-whisper model")
-                # Return standard model name as fallback
-                return self.config.get("faster_whisper_model_size", "medium")
-            else:
-                print(f"   🔄 Will attempt to use model name directly")
-                return model_name
+            # Import traceback for detailed error info
+            import traceback
+            print("   📊 Full traceback:")
+            traceback.print_exc()
+
+            # Return a meaningful fallback
+            return {
+                "text": f"Kotoba transcription encountered an error: {str(e)}",
+                "chunks": [{
+                    "text": f"Kotoba transcription encountered an error: {str(e)}",
+                    "timestamp": [0.0, min(10.0, audio_duration)]
+                }]
+            }
+
+    def _split_text_into_sentences(self, text: str) -> List[str]:
+        """NEW: Split text into sentences for better timestamp distribution."""
+        import re
+
+        # Split on common sentence endings, keeping the delimiter
+        sentences = re.split(r'([.!?。！？])', text)
+
+        # Recombine sentences with their punctuation
+        result = []
+        for i in range(0, len(sentences) - 1, 2):
+            sentence = sentences[i]
+            if i + 1 < len(sentences):
+                sentence += sentences[i + 1]  # Add punctuation back
+
+            sentence = sentence.strip()
+            if sentence and len(sentence) > 2:
+                result.append(sentence)
+
+        # Handle case where last sentence has no punctuation
+        if len(sentences) % 2 == 1:
+            last_sentence = sentences[-1].strip()
+            if last_sentence and len(last_sentence) > 2:
+                result.append(last_sentence)
+
+        return result if result else [text]
+
 
     def _update_progress(self, progress: float):
         """Update transcription progress."""
@@ -820,142 +1105,389 @@ class WhisperTranscriber:
 
         return has_config and has_model
 
+    def _convert_kotoba_to_faster_whisper(self, kotoba_model_name: str, output_path: str) -> str:
+        """NEW: Convert Kotoba-whisper model to faster-whisper format using CTranslate2."""
+        if not KOTOBA_CONVERSION_AVAILABLE:
+            raise RuntimeError("Kotoba conversion dependencies not available")
+
+        print(f"🎌 Converting Kotoba model: {kotoba_model_name}")
+        print(f"   Output path: {output_path}")
+
+        try:
+            # Import CTranslate2 for proper conversion
+            try:
+                import ctranslate2
+                CT2_AVAILABLE = True
+            except ImportError:
+                print("   ❌ CTranslate2 not available - trying alternative conversion method")
+                CT2_AVAILABLE = False
+
+            # Create output directory
+            os.makedirs(output_path, exist_ok=True)
+
+            # Method 1: Try CTranslate2 conversion (preferred)
+            if CT2_AVAILABLE:
+                print("   🔄 Using CTranslate2 for proper conversion...")
+                try:
+                    # Convert using CTranslate2
+                    converter = ctranslate2.converters.TransformersConverter(kotoba_model_name)
+                    converter.convert(output_path, quantization="int8", force=True)  # Add force=True
+
+                    print("   ✅ Kotoba model converted successfully with CTranslate2!")
+                    return output_path
+
+                except Exception as ct2_e:
+                    print(f"   ⚠️  CTranslate2 conversion failed: {ct2_e}")
+                    print("   🔄 Falling back to alternative method...")
+
+            # Method 2: Alternative - Use Hugging Face to OpenAI format, then convert
+            print("   📥 Loading Kotoba model for alternative conversion...")
+
+            # Create temporary directory for intermediate files
+            import tempfile
+            temp_dir = tempfile.mkdtemp(prefix="kotoba_conversion_")
+
+            try:
+                from transformers import WhisperForConditionalGeneration, WhisperTokenizer
+
+                # Load the model
+                model = WhisperForConditionalGeneration.from_pretrained(
+                    kotoba_model_name,
+                    cache_dir=self.config["whisper_models_location"],
+                    torch_dtype=torch.float16 if torch.cuda.is_available() else torch.float32
+                )
+                tokenizer = WhisperTokenizer.from_pretrained(kotoba_model_name)
+
+                # Save in OpenAI Whisper format
+                openai_format_path = os.path.join(temp_dir, "openai_format")
+                os.makedirs(openai_format_path, exist_ok=True)
+
+                # Save model and tokenizer
+                model.save_pretrained(openai_format_path)
+                tokenizer.save_pretrained(openai_format_path)
+
+                print("   🔄 Converting OpenAI format to CTranslate2...")
+
+                # Try conversion with different methods
+                conversion_success = False
+
+                # Try direct ctranslate2 conversion from the saved path
+                if CT2_AVAILABLE:
+                    try:
+                        converter = ctranslate2.converters.TransformersConverter(openai_format_path)
+                        converter.convert(output_path, quantization="int8", force=True)  # Add force=True
+                        conversion_success = True
+                        print("   ✅ Alternative CTranslate2 conversion successful!")
+                    except Exception as e:
+                        print(f"   ⚠️  Alternative CTranslate2 conversion failed: {e}")
+
+                # If CTranslate2 still fails, create a compatibility wrapper
+                if not conversion_success:
+                    print("   🔧 Creating compatibility wrapper...")
+                    self._create_kotoba_compatibility_wrapper(kotoba_model_name, output_path, openai_format_path)
+                    conversion_success = True
+
+            finally:
+                # Clean up temporary directory
+                import shutil
+                try:
+                    shutil.rmtree(temp_dir)
+                except Exception:
+                    pass
+
+            if conversion_success:
+                print("   ✅ Kotoba model conversion completed!")
+                return output_path
+            else:
+                raise RuntimeError("All conversion methods failed")
+
+        except Exception as e:
+            print(f"   ❌ Kotoba conversion failed: {e}")
+            raise RuntimeError(f"Failed to convert Kotoba model: {e}")
+
+    def _create_kotoba_compatibility_wrapper(self, kotoba_model_name: str, output_path: str, openai_format_path: str):
+        """NEW: Create a compatibility wrapper when direct conversion fails."""
+        print("   📦 Creating compatibility wrapper for Kotoba model...")
+
+        try:
+            # Create a wrapper script that can be used with faster-whisper
+            wrapper_info = {
+                "model_type": "kotoba-whisper-wrapper",
+                "original_model": kotoba_model_name,
+                "openai_format_path": openai_format_path,
+                "wrapper_version": "1.0",
+                "instructions": "This model requires special loading via transformers pipeline",
+                "conversion_date": datetime.datetime.now().isoformat()
+            }
+
+            # Save wrapper info
+            wrapper_info_path = os.path.join(output_path, "kotoba_wrapper_info.json")
+            with open(wrapper_info_path, 'w') as f:
+                json.dump(wrapper_info, f, indent=2)
+
+            # Create a flag file to indicate this is a wrapper
+            wrapper_flag_path = os.path.join(output_path, ".kotoba_wrapper")
+            with open(wrapper_flag_path, 'w') as f:
+                f.write(kotoba_model_name)
+
+            print("   ✅ Compatibility wrapper created")
+
+        except Exception as e:
+            print(f"   ❌ Wrapper creation failed: {e}")
+            raise
+
+    def _check_kotoba_conversion_needed(self, kotoba_model_name: str) -> tuple[bool, str]:
+        """NEW: Check if Kotoba model needs conversion and return cache path."""
+        if not self.use_kotoba_whisper:
+            return False, ""
+
+        # Generate cache path
+        model_cache_name = kotoba_model_name.replace("/", "--").replace(":", "--")
+        cache_dir = self.config.get("kotoba_conversion_cache_dir",
+                                    os.path.join(self.config["whisper_models_location"], "kotoba_converted"))
+        converted_path = os.path.join(cache_dir, model_cache_name)
+
+        # Check if conversion exists and is valid
+        if os.path.exists(converted_path):
+            # Check for CTranslate2 format files
+            ct2_files = ["config.json", "model.bin"]
+            ct2_valid = all(os.path.exists(os.path.join(converted_path, f)) for f in ct2_files)
+
+            # Check for wrapper format
+            wrapper_flag = os.path.join(converted_path, ".kotoba_wrapper")
+            wrapper_valid = os.path.exists(wrapper_flag)
+
+            if ct2_valid:
+                print(f"✅ Found cached Kotoba CTranslate2 conversion: {converted_path}")
+                return False, converted_path  # No conversion needed
+            elif wrapper_valid:
+                print(f"⚠️  Found cached Kotoba wrapper conversion: {converted_path}")
+                print(f"   📝 Note: Using compatibility mode - consider installing ctranslate2")
+                return False, converted_path  # No conversion needed
+
+        return True, converted_path  # Conversion needed
+
+    def _load_kotoba_wrapper_model(self, wrapper_path: str, kotoba_model_name: str):
+        """NEW: Load Kotoba model using wrapper when CTranslate2 conversion fails."""
+        print(f"📦 Loading Kotoba model via compatibility wrapper...")
+
+        try:
+            # Load wrapper info
+            wrapper_info_path = os.path.join(wrapper_path, "kotoba_wrapper_info.json")
+            if os.path.exists(wrapper_info_path):
+                with open(wrapper_info_path, 'r') as f:
+                    wrapper_info = json.load(f)
+
+                print(f"   🎌 Original model: {wrapper_info['original_model']}")
+                print(f"   📅 Converted: {wrapper_info['conversion_date']}")
+
+            # For wrapper mode, we'll need to modify the transcription method
+            self._kotoba_wrapper_mode = True
+            self._kotoba_model_name = kotoba_model_name
+
+            # Load transformers pipeline for Kotoba with optimized settings
+            from transformers import pipeline
+
+            print("   📥 Loading Kotoba model via transformers pipeline...")
+
+            # Determine device and dtype
+            device = 0 if torch.cuda.is_available() else -1
+            torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+            print(f"   🖥️  Device: {'CUDA' if device >= 0 else 'CPU'}, dtype: {torch_dtype}")
+
+            try:
+                # Try loading with minimal parameters first
+                self._kotoba_pipeline = pipeline(
+                    "automatic-speech-recognition",
+                    model=kotoba_model_name,
+                    device=device,
+                    torch_dtype=torch_dtype,
+                    model_kwargs={
+                        "use_safetensors": True,
+                    },
+                    # Remove problematic parameters for initial loading
+                )
+
+                print("   ✅ Basic pipeline loaded successfully!")
+
+                # Test with minimal audio
+                print("   🧪 Testing Kotoba pipeline with minimal audio...")
+                test_audio = np.zeros(1600, dtype=np.float32)  # 0.1 seconds of silence
+
+                try:
+                    test_result = self._kotoba_pipeline(test_audio)
+                    print(f"   ✅ Pipeline test successful!")
+                    print(f"   📊 Test result type: {type(test_result)}")
+                    if isinstance(test_result, dict):
+                        print(f"   📊 Test result keys: {test_result.keys()}")
+                        test_text = test_result.get('text', '')
+                        print(f"   📊 Test text: '{test_text[:50]}...'")
+                except Exception as test_e:
+                    print(f"   ⚠️  Pipeline test had issues: {test_e}")
+                    print("   📝 This might be normal for silence - continuing...")
+
+                print("   ✅ Kotoba wrapper model loaded successfully!")
+                return True
+
+            except Exception as load_e:
+                print(f"   ❌ Pipeline loading failed: {load_e}")
+                print("   🔄 Trying fallback loading method...")
+
+                # Try with even more minimal settings
+                try:
+                    self._kotoba_pipeline = pipeline(
+                        "automatic-speech-recognition",
+                        model=kotoba_model_name,
+                        device=-1,  # Force CPU
+                        torch_dtype=torch.float32,
+                    )
+                    print("   ✅ Fallback pipeline loaded successfully!")
+                    return True
+
+                except Exception as fallback_e:
+                    print(f"   ❌ Fallback loading also failed: {fallback_e}")
+                    return False
+
+        except Exception as e:
+            print(f"   ❌ Wrapper loading failed: {e}")
+            print("   💡 Try installing: pip install torch torchaudio transformers accelerate")
+
+            # Import traceback for detailed error info
+            import traceback
+            print("   📊 Full traceback:")
+            traceback.print_exc()
+
+            return False
+
+    def _check_kotoba_conversion_needed(self, kotoba_model_name: str) -> tuple[bool, str]:
+        """NEW: Check if Kotoba model needs conversion and return cache path."""
+        if not self.use_kotoba_whisper:
+            return False, ""
+
+        # Generate cache path
+        model_cache_name = kotoba_model_name.replace("/", "--").replace(":", "--")
+        cache_dir = self.config.get("kotoba_conversion_cache_dir",
+                                    os.path.join(self.config["whisper_models_location"], "kotoba_converted"))
+        converted_path = os.path.join(cache_dir, model_cache_name)
+
+        # Check if conversion exists and is valid
+        if os.path.exists(converted_path):
+            config_file = os.path.join(converted_path, "config.json")
+            model_file = os.path.join(converted_path, "model.bin")
+
+            if os.path.exists(config_file) and os.path.exists(model_file):
+                print(f"✅ Found cached Kotoba conversion: {converted_path}")
+                return False, converted_path  # No conversion needed
+
+        return True, converted_path  # Conversion needed
+
     def _load_faster_whisper_model(self):
-        """Load the faster-whisper model with support for kotoba-whisper."""
+        """Load the faster-whisper model with optimized settings."""
         if self.model is None:
-            model_info = self._get_model_info()
-            model_name = model_info["model_name"]
-            model_type = model_info["model_type"]
+            # Initialize wrapper mode flags
+            self._kotoba_wrapper_mode = False
+            self._kotoba_pipeline = None
 
-            compute_type = self.config.get("faster_whisper_compute_type", "int8")
-            num_workers = self.config.get("faster_whisper_num_workers", 1)
+            # NEW: Handle Kotoba-whisper model loading
+            if self.use_kotoba_whisper:
+                kotoba_model_name = self.config.get("kotoba_model_name", "kotoba-tech/kotoba-whisper-v1.0")
+                print(f"🎌 Loading Kotoba-whisper model: {kotoba_model_name}")
 
-            cpu_threads = self._get_optimal_cpu_threads()
+                # Check if conversion is needed
+                needs_conversion, model_path_to_use = self._check_kotoba_conversion_needed(kotoba_model_name)
 
-            print(f"Loading {model_type}: {model_name}")
-            print(f"Compute type: {compute_type}, Device: {self.device}, Threads: {cpu_threads}")
+                if needs_conversion:
+                    print("🔄 Converting Kotoba model to faster-whisper format...")
+                    try:
+                        model_path_to_use = self._convert_kotoba_to_faster_whisper(kotoba_model_name, model_path_to_use)
+                    except Exception as e:
+                        print(f"❌ Kotoba conversion failed: {e}")
+                        print("🔄 Falling back to base model...")
+                        # Fall back to base model if conversion fails completely
+                        self.use_kotoba_whisper = False
+                        model_path_to_use = "base"
 
-            # Find model path - check multiple possible locations
-            cache_dir = self.config["whisper_models_location"]
-            model_path_to_use = model_name  # Default fallback
-            model_found = False
+                # Check if this is a wrapper mode
+                if self.use_kotoba_whisper and os.path.exists(os.path.join(model_path_to_use, ".kotoba_wrapper")):
+                    print("📦 Detected Kotoba wrapper format")
+                    if self._load_kotoba_wrapper_model(model_path_to_use, kotoba_model_name):
+                        # Wrapper loaded successfully, skip faster-whisper loading
+                        print("✅ Kotoba-whisper model loaded via wrapper!")
+                        return
+                    else:
+                        print("❌ Wrapper loading failed, falling back to base model")
+                        self.use_kotoba_whisper = False
+                        model_path_to_use = "base"
 
-            # Check configured local path first
-            if model_info["local_path"] and os.path.exists(model_info["local_path"]):
-                if self._check_model_files_exist(model_info["local_path"]):
-                    model_path_to_use = model_info["local_path"]
-                    model_found = True
-                    print(f"✅ Found configured {model_type} at: {model_info['local_path']}")
+            if not self.use_kotoba_whisper:
+                # Existing faster-whisper model loading logic
+                model_size = self.config.get("faster_whisper_model_size", "large-v3")
+                local_model_path = self.config.get("faster_whisper_local_model_path")
 
-            # Check cache directory with pattern
-            if not model_found:
-                actual_model_path = os.path.join(cache_dir, model_info["cache_pattern"])
+                print(f"Loading faster-whisper: {model_size}")
+
+                # Find model path
+                cache_dir = self.config["whisper_models_location"]
+                actual_model_path = os.path.join(cache_dir, f"models--Systran--faster-whisper-{model_size}")
+                model_path_to_use = model_size
+
                 if os.path.exists(actual_model_path):
                     snapshots_path = os.path.join(actual_model_path, "snapshots")
                     if os.path.exists(snapshots_path):
                         snapshots = [d for d in os.listdir(snapshots_path) if
                                      os.path.isdir(os.path.join(snapshots_path, d))]
                         if snapshots:
-                            snapshots.sort()  # Use most recent
-                            snapshot_path = os.path.join(snapshots_path, snapshots[-1])
+                            snapshot_path = os.path.join(snapshots_path, snapshots[0])
                             if self._check_model_files_exist(snapshot_path):
                                 model_path_to_use = snapshot_path
-                                model_found = True
-                                print(f"✅ Found cached {model_type} at: {snapshot_path}")
 
-            # If model not found locally, download it
-            if not model_found:
-                print(f"🔍 {model_type} not found locally, downloading...")
-                if model_type == "kotoba-whisper":
-                    print(f"🇯🇵 First-time setup: Downloading kotoba-whisper for Japanese speech recognition")
-                    print(f"   📥 Model size: ~1-3GB (depending on variant)")
-                    print(f"   💾 Will be cached at: {cache_dir}")
+                elif local_model_path and os.path.exists(local_model_path):
+                    if self._check_model_files_exist(local_model_path):
+                        model_path_to_use = local_model_path
 
-                model_path_to_use = self._download_model(model_info)
+                if model_path_to_use == model_size:
+                    print(f"🔍 Downloading model: {model_size}")
+                    model_path_to_use = self._download_faster_whisper_model(model_size, local_model_path)
 
-                # Verify download was successful
-                if model_path_to_use != model_name and os.path.exists(model_path_to_use):
-                    if self._check_model_files_exist(model_path_to_use):
-                        print(f"✅ {model_type} download completed and verified!")
+            # Common loading parameters for faster-whisper
+            compute_type = self.config.get("faster_whisper_compute_type", "int8")
+            num_workers = self.config.get("faster_whisper_num_workers", 1)
+            cpu_threads = self._get_optimal_cpu_threads()
+
+            # Only load faster-whisper if not in wrapper mode
+            if not self._kotoba_wrapper_mode:
+                print(
+                    f"Loading {'Kotoba-whisper (converted)' if self.use_kotoba_whisper else 'faster-whisper'}: {os.path.basename(model_path_to_use)}")
+                print(f"Compute type: {compute_type}, Device: {self.device}, Threads: {cpu_threads}")
+
+                try:
+                    self.model = WhisperModel(
+                        model_path_to_use,
+                        device=self.device,
+                        compute_type=compute_type,
+                        download_root=self.config["whisper_models_location"],
+                        cpu_threads=cpu_threads,
+                        num_workers=num_workers
+                    )
+
+                    # NEW: Special success message for Kotoba
+                    if self.use_kotoba_whisper:
+                        print("✅ Kotoba-whisper model loaded successfully (converted to faster-whisper format)!")
                     else:
-                        print(f"⚠️  {model_type} downloaded but verification failed, will use model name")
-                        model_path_to_use = model_name
+                        print("✅ faster-whisper model loaded successfully!")
 
-            try:
-                print(f"⏳ Initializing {model_type} model...")
-
-                # Load the model with optimized settings
-                self.model = WhisperModel(
-                    model_path_to_use,
-                    device=self.device,
-                    compute_type=compute_type,
-                    download_root=self.config["whisper_models_location"],
-                    cpu_threads=cpu_threads,
-                    num_workers=num_workers
-                )
-
-                print(f"✅ {model_type} model loaded successfully!")
-
-                # Special settings and info for kotoba-whisper
-                if self.use_kotoba_whisper:
-                    print("🇯🇵 Kotoba-whisper ready! Optimizations applied:")
-                    print("   • Enhanced Japanese phoneme recognition")
-                    print("   • Optimized for Japanese speech patterns")
-                    print("   • Improved handling of Japanese audio characteristics")
-                    print("   • Lower VAD thresholds for better Japanese detection")
-
-                    # Verify this is actually a kotoba model (basic check)
-                    if "kotoba" not in str(model_path_to_use).lower():
-                        print("   ⚠️  Note: Model path doesn't contain 'kotoba' - verify correct model loaded")
-                else:
-                    print(f"✅ Standard faster-whisper model ready")
-                    print(f"   Model path: {model_path_to_use}")
-
-            except Exception as e:
-                print(f"❌ Error loading {model_type}: {e}")
-
-                # Enhanced fallback logic
-                if self.use_kotoba_whisper:
-                    print("🔄 Kotoba-whisper failed, trying standard faster-whisper fallback...")
-                    try:
-                        # Try standard model as fallback
-                        fallback_model = self.config.get("faster_whisper_model_size", "medium")
-                        self.model = WhisperModel(
-                            fallback_model,
-                            device="cpu",
-                            compute_type="int8",
-                            download_root=self.config["whisper_models_location"],
-                            cpu_threads=cpu_threads
-                        )
-                        self.use_kotoba_whisper = False  # Reset kotoba flag
-                        print(f"✅ Fallback to standard faster-whisper ({fallback_model}) successful!")
-                    except Exception as fallback_e:
-                        print(f"❌ Fallback also failed: {fallback_e}")
-                        # Last resort - try base model
-                        try:
-                            self.model = WhisperModel("base", device="cpu", compute_type="int8")
-                            self.use_kotoba_whisper = False
-                            print("✅ Emergency fallback: base model loaded!")
-                        except Exception as emergency_e:
-                            raise RuntimeError(f"Could not load any model: {emergency_e}")
-                else:
-                    print("🔄 Trying base model fallback...")
+                except Exception as e:
+                    print(f"❌ Error loading model: {e}")
+                    print("🔄 Trying fallback settings...")
                     try:
                         self.model = WhisperModel("base", device="cpu", compute_type="int8")
-                        print("✅ Fallback base model loaded!")
+                        if self.use_kotoba_whisper:
+                            print("✅ Fallback base model loaded (Kotoba conversion failed)!")
+                        else:
+                            print("✅ Fallback base model loaded!")
                     except Exception as fallback_e:
                         raise RuntimeError(f"Could not load any model: {fallback_e}")
-
-            # Final verification
-            if self.model is not None:
-                print(f"🎯 Model ready for transcription!")
-                if self.use_kotoba_whisper:
-                    print(f"🇯🇵 Japanese speech recognition mode: ACTIVE")
-                print(f"💾 Model cache location: {cache_dir}")
-            else:
-                raise RuntimeError("Model loading failed completely")
-
-
 
     def _load_hf_model(self):
         """Load the Hugging Face Transformers Whisper model."""
@@ -1868,90 +2400,54 @@ class WhisperTranscriber:
             f.write(srt.compose(subs))
 
     def _transcribe_with_faster_whisper(self, audio_data: Dict[str, Any], audio_duration: float) -> Dict[str, Any]:
-        """Transcribe using faster-whisper with enhanced speech detection and kotoba-whisper support."""
+        """Transcribe using faster-whisper with enhanced speech detection, or Kotoba wrapper."""
+
+        # NEW: Handle Kotoba wrapper mode
+        if hasattr(self, '_kotoba_wrapper_mode') and self._kotoba_wrapper_mode and hasattr(self, '_kotoba_pipeline'):
+            print("🎌 Using Kotoba-whisper via transformers pipeline (wrapper mode)")
+            return self._transcribe_with_kotoba_wrapper(audio_data, audio_duration)
+
+        # Original faster-whisper transcription code
         if self.model is None:
             raise RuntimeError("faster-whisper model is not loaded")
-
-        model_type = "kotoba-whisper" if self.use_kotoba_whisper else "faster-whisper"
-        print(f"🚀 Starting enhanced {model_type} transcription with accurate speech detection...")
-
-        # Enhanced VAD parameters for kotoba-whisper
-        if self.use_kotoba_whisper:
-            # Kotoba-whisper optimized VAD parameters
-            vad_parameters = {
-                "threshold": self.config.get("faster_whisper_vad_threshold", 0.12),  # Slightly lower for Japanese
-                "min_silence_duration_ms": self.config.get("faster_whisper_min_silence_duration_ms", 400),
-                # Shorter for Japanese
-                "max_speech_duration_s": self.config.get("faster_whisper_max_speech_duration_s", 25),
-                # Shorter segments
-                "min_speech_duration_ms": self.config.get("faster_whisper_min_speech_duration_ms", 80)
-                # Shorter minimum
-            }
-            print(f"   🇯🇵 Kotoba VAD (Japanese optimized): threshold={vad_parameters['threshold']}")
-        else:
-            # Standard VAD parameters
-            vad_parameters = {
-                "threshold": self.config.get("faster_whisper_vad_threshold", 0.15),
-                "min_silence_duration_ms": self.config.get("faster_whisper_min_silence_duration_ms", 500),
-                "max_speech_duration_s": self.config.get("faster_whisper_max_speech_duration_s", 30),
-                "min_speech_duration_ms": self.config.get("faster_whisper_min_speech_duration_ms", 100)
-            }
-            print(f"   🎯 Enhanced VAD: threshold={vad_parameters['threshold']}")
-
+        print("🚀 Starting enhanced faster-whisper transcription with accurate speech detection...")
+        vad_parameters = {
+            "threshold": self.config.get("faster_whisper_vad_threshold", 0.15),
+            "min_silence_duration_ms": self.config.get("faster_whisper_min_silence_duration_ms", 500),
+            "max_speech_duration_s": self.config.get("faster_whisper_max_speech_duration_s", 30),
+            "min_speech_duration_ms": self.config.get("faster_whisper_min_speech_duration_ms", 100)
+        }
+        print(
+            f"   🎯 Enhanced VAD: threshold={vad_parameters['threshold']}, min_silence={vad_parameters['min_silence_duration_ms']}ms")
         print(
             f"   🎯 Speech duration: {vad_parameters['min_speech_duration_ms']}-{vad_parameters['max_speech_duration_s'] * 1000}ms")
-
-        # Enhanced parameters for kotoba-whisper
-        transcription_params = {
-            "task": self.config.get("faster_whisper_task", "translate"),
-            "language": self.config.get("faster_whisper_force_language", None),
-            "initial_prompt": self.config.get("faster_whisper_initial_prompt", None),
-            "beam_size": self.config.get("faster_whisper_beam_size", 5),
-            "best_of": self.config.get("faster_whisper_best_of", 2),
-            "temperature": self.config.get("faster_whisper_temperature", [0.0, 0.2, 0.4]),
-            "patience": self.config.get("faster_whisper_patience", 1.5),
-            "length_penalty": self.config.get("faster_whisper_length_penalty", 1.0),
-            "repetition_penalty": self.config.get("faster_whisper_repetition_penalty", 1.15),
-            "no_repeat_ngram_size": self.config.get("faster_whisper_no_repeat_ngram_size", 5),
-            "suppress_blank": True,
-            "suppress_tokens": [-1],
-            "without_timestamps": False,
-            "max_initial_timestamp": 1.0,
-            "prepend_punctuations": "\"'([{-",
-            "append_punctuations": "\"'.,:!?)]}",
-            "vad_filter": True,
-            "vad_parameters": vad_parameters,
-            "word_timestamps": True
-        }
-
-        # Kotoba-whisper specific optimizations
-        if self.use_kotoba_whisper:
-            # Optimize for Japanese audio characteristics
-            transcription_params.update({
-                "no_speech_threshold": 0.35,  # Lower threshold for Japanese
-                "log_prob_threshold": -2.8,  # More lenient for Japanese
-                "compression_ratio_threshold": 2.8,  # Higher threshold for Japanese text
-            })
-            print("   🇯🇵 Applied kotoba-whisper Japanese optimizations")
-        else:
-            # Standard parameters
-            transcription_params.update({
-                "no_speech_threshold": 0.4,
-                "log_prob_threshold": -2.5,
-                "compression_ratio_threshold": 2.4,
-            })
-
         try:
             segments_generator, info = self.model.transcribe(
                 audio_data["array"],
-                **transcription_params
+                task=self.config.get("faster_whisper_task", "translate"),
+                language=self.config.get("faster_whisper_force_language", None),
+                initial_prompt=self.config.get("faster_whisper_initial_prompt", None),
+                beam_size=self.config.get("faster_whisper_beam_size", 5),
+                best_of=self.config.get("faster_whisper_best_of", 2),
+                temperature=self.config.get("faster_whisper_temperature", [0.0, 0.2, 0.4]),
+                patience=self.config.get("faster_whisper_patience", 1.5),
+                length_penalty=self.config.get("faster_whisper_length_penalty", 1.0),
+                repetition_penalty=self.config.get("faster_whisper_repetition_penalty", 1.15),
+                no_repeat_ngram_size=self.config.get("faster_whisper_no_repeat_ngram_size", 5),
+                suppress_blank=True,
+                suppress_tokens=[-1],
+                without_timestamps=False,
+                max_initial_timestamp=1.0,
+                prepend_punctuations="\"'([{-",
+                append_punctuations="\"'.,:!?)]}",
+                vad_filter=True,
+                vad_parameters=vad_parameters,
+                no_speech_threshold=0.4,
+                log_prob_threshold=-2.5,
+                compression_ratio_threshold=2.4,
+                word_timestamps=True
             )
-
             print(f"📊 Language: {info.language} (confidence: {info.language_probability:.2f})")
-            if self.use_kotoba_whisper and info.language == "ja":
-                print("   🇯🇵 Japanese detected - kotoba-whisper optimizations active!")
-
-            # Rest of the transcription processing remains the same...
             chunks = []
             last_end_time = 0.0
             segment_count = 0
@@ -1960,36 +2456,29 @@ class WhisperTranscriber:
             segment_confidence_threshold = self.config.get("segment_confidence_threshold", 0.35)
             enable_confidence_filtering = self.config.get("enable_confidence_filtering", True)
             enable_text = self.config.get("enable_text", True)
-
-            # Adjust confidence thresholds for kotoba-whisper
-            if self.use_kotoba_whisper:
-                word_confidence_threshold *= 0.9  # Slightly lower for Japanese
-                segment_confidence_threshold *= 0.9
-
             for segment in segments_generator:
                 segment_count += 1
                 text = segment.text.strip() if hasattr(segment, 'text') else ""
                 if not text or len(text) < 2:
                     filtered_count += 1
                     continue
-
                 if hasattr(segment, 'words') and segment.words and enable_confidence_filtering:
                     high_conf_words = [w for w in segment.words if
                                        w.word.strip() and w.probability >= word_confidence_threshold]
                     if not high_conf_words:
                         if enable_text:
                             print(f"   ❌ Filtered low-confidence segment: '{text[:30]}...' (no high-conf words)")
+
                         filtered_count += 1
                         continue
-
                     avg_confidence = np.mean([w.probability for w in high_conf_words])
                     if avg_confidence < segment_confidence_threshold:
                         if enable_text:
                             print(
                                 f"   ❌ Filtered low-confidence segment: '{text[:30]}...' (conf: {avg_confidence:.2f})")
+
                         filtered_count += 1
                         continue
-
                     start = max(float(high_conf_words[0].start) - 0.1, float(segment.start))
                     end = min(float(high_conf_words[-1].end) + 0.1, float(segment.end))
                     if enable_text:
@@ -1999,49 +2488,105 @@ class WhisperTranscriber:
                     start = float(segment.start)
                     end = float(segment.end)
                     if enable_text:
-                        print(f"   ⚠️ No word timestamps: {start:.2f}-{end:.2f}, '{text[:30]}...'")
-
+                        print(
+                            f"   ⚠️ No word timestamps or confidence filtering disabled: {start:.2f}-{end:.2f}, '{text[:30]}...'")
                 if start < last_end_time:
                     start = last_end_time + 0.1
                     if end <= start:
                         end = start + 0.5
-
                 if end - start < 0.2 or end - start > 30.0:
                     filtered_count += 1
                     continue
-
                 chunk_data = {
                     "text": text,
                     "timestamp": [start, end]
                 }
                 chunks.append(chunk_data)
                 last_end_time = end
-
                 progress = min(100.0, (last_end_time / audio_duration) * 100) if audio_duration > 0 else 0
                 self._update_progress(progress)
-
             self._update_progress(100.0)
             print(f"\n✅ Processing complete: {len(chunks)} valid segments, {filtered_count} filtered")
-
             if len(chunks) == 0:
                 print("⚠️ No valid segments detected - possible silence or very low quality audio")
                 chunks = [{
                     "text": "No speech detected in audio.",
                     "timestamp": [0.0, min(5.0, audio_duration)]
                 }]
-
             full_text = " ".join([chunk["text"] for chunk in chunks])
             return {
                 "text": full_text,
                 "chunks": chunks
             }
-
         except Exception as e:
-            print(f"\n❌ {model_type} error: {e}")
+            print(f"\n❌ faster-whisper error: {e}")
             return {
                 "text": "Transcription completed with fallback.",
                 "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
             }
+
+    def _load_kotoba_wrapper_model(self, wrapper_path: str, kotoba_model_name: str):
+        """NEW: Load Kotoba model using wrapper when CTranslate2 conversion fails."""
+        print(f"📦 Loading Kotoba model via compatibility wrapper...")
+
+        try:
+            # Load wrapper info
+            wrapper_info_path = os.path.join(wrapper_path, "kotoba_wrapper_info.json")
+            with open(wrapper_info_path, 'r') as f:
+                wrapper_info = json.load(f)
+
+            print(f"   🎌 Original model: {wrapper_info['original_model']}")
+            print(f"   📅 Converted: {wrapper_info['conversion_date']}")
+
+            # For wrapper mode, we'll need to modify the transcription method
+            # to use transformers pipeline instead of faster-whisper
+            self._kotoba_wrapper_mode = True
+            self._kotoba_model_name = kotoba_model_name
+
+            # Load transformers pipeline for Kotoba with optimized settings
+            from transformers import pipeline
+
+            print("   📥 Loading Kotoba model via transformers pipeline...")
+
+            # Determine device
+            device = 0 if torch.cuda.is_available() else -1
+            torch_dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+
+            print(f"   🖥️  Device: {'CUDA' if device >= 0 else 'CPU'}, dtype: {torch_dtype}")
+
+            self._kotoba_pipeline = pipeline(
+                "automatic-speech-recognition",
+                model=kotoba_model_name,
+                device=device,
+                torch_dtype=torch_dtype,
+                model_kwargs={
+                    "use_safetensors": True,
+                    "attn_implementation": "eager",  # Use eager attention for compatibility
+                },
+                # Set chunk length to avoid token limit issues
+                chunk_length_s=30,
+                stride_length_s=5,
+                return_timestamps="word" if self.config.get("faster_whisper_word_timestamps", True) else True,
+            )
+
+            # Test the pipeline with a small audio sample to ensure it works
+            print("   🧪 Testing Kotoba pipeline...")
+            test_audio = np.random.normal(0, 0.01, 1600).astype(np.float32)  # 0.1 seconds of noise
+
+            try:
+                test_result = self._kotoba_pipeline(test_audio)
+                print(f"   ✅ Pipeline test successful: '{test_result.get('text', '')[:50]}...'")
+            except Exception as test_e:
+                print(f"   ⚠️  Pipeline test warning: {test_e}")
+                # Continue anyway, the actual audio might work better
+
+            print("   ✅ Kotoba wrapper model loaded successfully!")
+            return True
+
+        except Exception as e:
+            print(f"   ❌ Wrapper loading failed: {e}")
+            print("   💡 Try installing: pip install torch torchaudio transformers accelerate")
+            return False
 
     def _transcribe_with_hf(self, audio_data: Dict[str, Any]) -> Dict[str, Any]:
         """Transcribe using HuggingFace Transformers Whisper."""
@@ -2274,360 +2819,116 @@ def main():
     # Load configuration
     config = load_config()
 
-    # Show enhanced features
+    # NEW: Enhanced engine display with Kotoba support
     if config.get("use_kotoba_whisper", False):
-        engine = "kotoba-whisper (Japanese optimized)"
-        print(f"🇯🇵 Kotoba-whisper mode: ENABLED")
-
-        # Check if kotoba model is available locally
-        transcriber_temp = WhisperTranscriber(config)
-        if transcriber_temp._is_kotoba_model_available_locally():
-            print(f"✅ Kotoba-whisper model: READY (cached locally)")
-        else:
-            print(f"📥 Kotoba-whisper model: WILL DOWNLOAD (first use)")
-            print(f"   💾 Download size: ~1-3GB")
-            print(f"   📁 Cache location: {config.get('whisper_models_location', 'default')}")
-        del transcriber_temp  # Clean up temporary instance
-
+        engine = "Kotoba-whisper (via faster-whisper)"
     elif config.get("use_faster_whisper", False):
         engine = "faster-whisper"
     else:
         engine = "HF Transformers"
 
     print(f"🚀 Engine: {engine} (Enhanced Speech Detection + MP3 Boost)")
+
+    # NEW: Show Kotoba-specific settings
+    if config.get("use_kotoba_whisper", False):
+        print(f"🎌 Kotoba Model: {config.get('kotoba_model_name', 'kotoba-tech/kotoba-whisper-v1.0')}")
+        print(f"🔄 Auto-convert: {'ENABLED' if config.get('kotoba_to_faster_whisper_convert', True) else 'DISABLED'}")
+        print(f"📁 Conversion cache: {config.get('kotoba_conversion_cache_dir', 'Default')}")
+
     print(f"🎵 MP3 Boost: {'ENABLED' if config.get('enable_mp3_transcription_boost', True) else 'DISABLED'}")
     print(f"🎯 Advanced VAD: {'ENABLED' if config.get('faster_whisper_vad_filter', True) else 'DISABLED'}")
     print(f"🔍 Speech Analysis: {'ENABLED' if config.get('enable_advanced_speech_detection', True) else 'DISABLED'}")
     print(f"⏱️  Timestamp Validation: {'ENABLED' if config.get('timestamp_validation_enabled', True) else 'DISABLED'}")
     print(f"🚫 Noise Filtering: {'ENABLED' if config.get('filter_background_noise', True) else 'DISABLED'}")
 
+    # Initialize transcriber
+    transcriber = WhisperTranscriber(config)
 
-# Initialize transcriber
-transcriber = WhisperTranscriber(config)
+    try:
+        # Check if batch mode is requested
+        if args.batch and args.batch.lower() in ['y', 'yes']:
+            print("\n📦 BATCH PROCESSING MODE")
+            print("=" * 50)
 
-try:
-    # Check if batch mode is requested
-    if args.batch and args.batch.lower() in ['y', 'yes']:
-        print("\n📦 BATCH PROCESSING MODE")
-        print("=" * 50)
+            # Initialize batch processor
+            batch_processor = BatchProcessor(transcriber, config)
 
-        # Initialize batch processor
-        batch_processor = BatchProcessor(transcriber, config)
+            # Show batch configuration
+            print(f"📁 Batch folder: {config.get('batch_folder', 'Not configured')}")
+            print(f"✅ Processed folder: {config.get('batch_processed_folder', 'Not configured')}")
+            print(f"❌ Failed folder: {config.get('batch_failed_folder', 'Not configured')}")
+            print(f"📋 Log file: {config.get('batch_log_file', 'Not configured')}")
+            print(f"⏭️  Skip existing: {'YES' if config.get('batch_skip_existing_srt', True) else 'NO'}")
+            print(f"📁 Move processed: {'YES' if config.get('batch_move_processed_files', True) else 'NO'}")
+            print(f"🔄 Continue on error: {'YES' if config.get('batch_continue_on_error', True) else 'NO'}")
 
-        # Show batch configuration
-        print(f"📁 Batch folder: {config.get('batch_folder', 'Not configured')}")
-        print(f"✅ Processed folder: {config.get('batch_processed_folder', 'Not configured')}")
-        print(f"❌ Failed folder: {config.get('batch_failed_folder', 'Not configured')}")
-        print(f"📋 Log file: {config.get('batch_log_file', 'Not configured')}")
-        print(f"⏭️  Skip existing: {'YES' if config.get('batch_skip_existing_srt', True) else 'NO'}")
-        print(f"📁 Move processed: {'YES' if config.get('batch_move_processed_files', True) else 'NO'}")
-        print(f"🔄 Continue on error: {'YES' if config.get('batch_continue_on_error', True) else 'NO'}")
+            # Process batch
+            stats = batch_processor.process_batch()
 
-        # Process batch
-        stats = batch_processor.process_batch()
+            # Show final results
+            print("\n" + "=" * 50)
+            print("📊 BATCH PROCESSING RESULTS:")
+            print(f"   ✅ Successful: {stats['success']}")
+            print(f"   ⏭️ Skipped: {stats['skipped']}")
+            print(f"   ❌ Failed: {stats['failed']}")
+            print(f"   📁 Total: {stats['total']}")
 
-        # Show final results
-        print("\n" + "=" * 50)
-        print("📊 BATCH PROCESSING RESULTS:")
-        print(f"   ✅ Successful: {stats['success']}")
-        print(f"   ⏭️ Skipped: {stats['skipped']}")
-        print(f"   ❌ Failed: {stats['failed']}")
-        print(f"   📁 Total: {stats['total']}")
+            if stats['success'] > 0:
+                print(f"\n🎉 Batch processing completed! {stats['success']} files transcribed successfully.")
+            else:
+                print(f"\n⚠️  No files were successfully transcribed.")
 
-        if stats['success'] > 0:
-            print(f"\n🎉 Batch processing completed! {stats['success']} files transcribed successfully.")
+        else:
+            # Single file mode
+            if not args.filename:
+                print("❌ Error: No filename provided for single file mode")
+                print("Usage: python transcribe7.py [filename] or python transcribe7.py --batch=y")
+                sys.exit(1)
+
+            print(f"\n📄 SINGLE FILE MODE")
+            print("=" * 50)
+
+            result = transcriber.transcribe_file(args.filename)
+            print(f"\n🎉 Success! Enhanced transcription saved: {result}")
+            print("\n💡 Enhanced features applied:")
+
+            # NEW: Show Kotoba-specific features if enabled
             if config.get("use_kotoba_whisper", False):
-                print(f"🇯🇵 Processed with Japanese speech optimization")
-        else:
-            print(f"\n⚠️  No files were successfully transcribed.")
+                print("   🎌 Kotoba-whisper model (Japanese specialized)")
+                print("   🔄 Automatic model conversion to faster-whisper format")
 
-    else:
-        # Single file mode
-        if not args.filename:
-            print("❌ Error: No filename provided for single file mode")
-            print("Usage: python transcribe7.py [filename] or python transcribe7.py --batch=y")
-            sys.exit(1)
+            print("   🎵 MP3 audio boosting for better transcription")
+            print("   🎚️  Audio normalization and compression")
+            print("   ✨ High-frequency emphasis for speech clarity")
+            print("   🎯 Accurate speech detection and timestamps")
+            print("   🚫 Background noise and silence filtering")
 
-        print(f"\n📄 SINGLE FILE MODE")
-        print("=" * 50)
+    except KeyboardInterrupt:
+        print("\n⏹️  Processing interrupted by user")
+        sys.exit(0)
+    except Exception as e:
+        print(f"\n❌ Error: {e}")
+        print("\n🔧 Troubleshooting:")
+        print("   • Install scipy for advanced features: pip install scipy")
 
-        result = transcriber.transcribe_file(args.filename)
-        print(f"\n🎉 Success! Enhanced transcription saved: {result}")
-        print("\n💡 Enhanced features applied:")
+        # NEW: Kotoba-specific troubleshooting
         if config.get("use_kotoba_whisper", False):
-            print("   🇯🇵 Kotoba-whisper Japanese speech optimization")
-            print("   📈 Enhanced Japanese phoneme detection")
-            print("   🎌 Optimized VAD settings for Japanese audio")
-        print("   🎵 MP3 audio boosting for better transcription")
-        print("   🎚️  Audio normalization and compression")
-        print("   ✨ High-frequency emphasis for speech clarity")
-        print("   🎯 Accurate speech detection and timestamps")
-        print("   🚫 Background noise and silence filtering")
+            print("   • For Kotoba-whisper: pip install transformers torch")
+            print("   • Check Kotoba model name and availability")
+            print("   • Verify conversion cache directory permissions")
 
-except KeyboardInterrupt:
-    print("\n⏹️  Processing interrupted by user")
-    sys.exit(0)
-except Exception as e:
-    print(f"\n❌ Error: {e}")
-    print("\n🔧 Troubleshooting:")
-    if config.get("use_kotoba_whisper", False):
-        print("   🇯🇵 Kotoba-whisper specific:")
-        print("      • Ensure stable internet for first-time download")
-        print("      • Check disk space (model ~1-3GB)")
-        print("      • Try disabling kotoba temporarily: use_kotoba_whisper: false")
-    print("   • Install scipy for advanced features: pip install scipy")
-    print("   • Check audio quality and volume levels")
-    print("   • Try adjusting VAD threshold in config")
-    print("   • Enable conservative_timing_mode in config")
-    if args.batch:
-        print("   • Check batch folder configuration and permissions")
-        print("   • Review batch processing log for detailed errors")
-    sys.exit(1)
+        print("   • Check audio quality and volume levels")
+        print("   • Try adjusting VAD threshold in config")
+        print("   • Enable conservative_timing_mode in config")
+        if args.batch:
+            print("   • Check batch folder configuration and permissions")
+            print("   • Review batch processing log for detailed errors")
+        sys.exit(1)
 
-# Rest of main() function remains the same...
-try:
-    # Check if batch mode is requested
-    if args.batch and args.batch.lower() in ['y', 'yes']:
-        print("\n📦 BATCH PROCESSING MODE")
-        print("=" * 50)
 
-        # Initialize batch processor
-        batch_processor = BatchProcessor(transcriber, config)
+if __name__ == "__main__":
+    main()
 
-        # Show batch configuration
-        print(f"📁 Batch folder: {config.get('batch_folder', 'Not configured')}")
-        print(f"✅ Processed folder: {config.get('batch_processed_folder', 'Not configured')}")
-        print(f"❌ Failed folder: {config.get('batch_failed_folder', 'Not configured')}")
-        print(f"📋 Log file: {config.get('batch_log_file', 'Not configured')}")
-        print(f"⏭️  Skip existing: {'YES' if config.get('batch_skip_existing_srt', True) else 'NO'}")
-        print(f"📁 Move processed: {'YES' if config.get('batch_move_processed_files', True) else 'NO'}")
-        print(f"🔄 Continue on error: {'YES' if config.get('batch_continue_on_error', True) else 'NO'}")
-
-        # Process batch
-        stats = batch_processor.process_batch()
-
-        # Show final results
-        print("\n" + "=" * 50)
-        print("📊 BATCH PROCESSING RESULTS:")
-        print(f"   ✅ Successful: {stats['success']}")
-        print(f"   ⏭️ Skipped: {stats['skipped']}")
-        print(f"   ❌ Failed: {stats['failed']}")
-        print(f"   📁 Total: {stats['total']}")
-
-        if stats['success'] > 0:
-            print(f"\n🎉 Batch processing completed! {stats['success']} files transcribed successfully.")
-            if config.get("use_kotoba_whisper", False):
-                print(f"🇯🇵 Processed with Japanese speech optimization")
-        else:
-            print(f"\n⚠️  No files were successfully transcribed.")
-
-    else:
-        # Single file mode
-        if not args.filename:
-            print("❌ Error: No filename provided for single file mode")
-            print("Usage: python transcribe7.py [filename] or python transcribe7.py --batch=y")
-            sys.exit(1)
-
-        print(f"\n📄 SINGLE FILE MODE")
-        print("=" * 50)
-
-        result = transcriber.transcribe_file(args.filename)
-        print(f"\n🎉 Success! Enhanced transcription saved: {result}")
-        print("\n💡 Enhanced features applied:")
-        if config.get("use_kotoba_whisper", False):
-            print("   🇯🇵 Kotoba-whisper Japanese speech optimization")
-            print("   📈 Enhanced Japanese phoneme detection")
-            print("   🎌 Optimized VAD settings for Japanese audio")
-        print("   🎵 MP3 audio boosting for better transcription")
-        print("   🎚️  Audio normalization and compression")
-        print("   ✨ High-frequency emphasis for speech clarity")
-        print("   🎯 Accurate speech detection and timestamps")
-        print("   🚫 Background noise and silence filtering")
-
-except KeyboardInterrupt:
-    print("\n⏹️  Processing interrupted by user")
-    sys.exit(0)
-except Exception as e:
-    print(f"\n❌ Error: {e}")
-    print("\n🔧 Troubleshooting:")
-    if config.get("use_kotoba_whisper", False):
-        print("   🇯🇵 Kotoba-whisper specific:")
-        print("      • Ensure stable internet for first-time download")
-        print("      • Check disk space (model ~1-3GB)")
-        print("      • Try disabling kotoba temporarily: use_kotoba_whisper: false")
-    print("   • Install scipy for advanced features: pip install scipy")
-    print("   • Check audio quality and volume levels")
-    print("   • Try adjusting VAD threshold in config")
-    print("   • Enable conservative_timing_mode in config")
-    if args.batch:
-        print("   • Check batch folder configuration and permissions")
-        print("   • Review batch processing log for detailed errors")
-    sys.exit(1)
-    _background_noise
-    ', True) else '
-    DISABLED
-    '}")
-
-# Initialize transcriber
-transcriber = WhisperTranscriber(config)
-
-try:
-    # Check if batch mode is requested
-    if args.batch and args.batch.lower() in ['y', 'yes']:
-        print("\n📦 BATCH PROCESSING MODE")
-        print("=" * 50)
-
-        # Initialize batch processor
-        batch_processor = BatchProcessor(transcriber, config)
-
-        # Show batch configuration
-        print(f"📁 Batch folder: {config.get('batch_folder', 'Not configured')}")
-        print(f"✅ Processed folder: {config.get('batch_processed_folder', 'Not configured')}")
-        print(f"❌ Failed folder: {config.get('batch_failed_folder', 'Not configured')}")
-        print(f"📋 Log file: {config.get('batch_log_file', 'Not configured')}")
-        print(f"⏭️  Skip existing: {'YES' if config.get('batch_skip_existing_srt', True) else 'NO'}")
-        print(f"📁 Move processed: {'YES' if config.get('batch_move_processed_files', True) else 'NO'}")
-        print(f"🔄 Continue on error: {'YES' if config.get('batch_continue_on_error', True) else 'NO'}")
-
-        # Process batch
-        stats = batch_processor.process_batch()
-
-        # Show final results
-        print("\n" + "=" * 50)
-        print("📊 BATCH PROCESSING RESULTS:")
-        print(f"   ✅ Successful: {stats['success']}")
-        print(f"   ⏭️ Skipped: {stats['skipped']}")
-        print(f"   ❌ Failed: {stats['failed']}")
-        print(f"   📁 Total: {stats['total']}")
-
-        if stats['success'] > 0:
-            print(f"\n🎉 Batch processing completed! {stats['success']} files transcribed successfully.")
-            if config.get("use_kotoba_whisper", False):
-                print(f"🇯🇵 Processed with Japanese speech optimization")
-        else:
-            print(f"\n⚠️  No files were successfully transcribed.")
-
-    else:
-        # Single file mode
-        if not args.filename:
-            print("❌ Error: No filename provided for single file mode")
-            print("Usage: python transcribe7.py [filename] or python transcribe7.py --batch=y")
-            sys.exit(1)
-
-        print(f"\n📄 SINGLE FILE MODE")
-        print("=" * 50)
-
-        result = transcriber.transcribe_file(args.filename)
-        print(f"\n🎉 Success! Enhanced transcription saved: {result}")
-        print("\n💡 Enhanced features applied:")
-        if config.get("use_kotoba_whisper", False):
-            print("   🇯🇵 Kotoba-whisper Japanese speech optimization")
-            print("   📈 Enhanced Japanese phoneme detection")
-            print("   🎌 Optimized VAD settings for Japanese audio")
-        print("   🎵 MP3 audio boosting for better transcription")
-        print("   🎚️  Audio normalization and compression")
-        print("   ✨ High-frequency emphasis for speech clarity")
-        print("   🎯 Accurate speech detection and timestamps")
-        print("   🚫 Background noise and silence filtering")
-
-except KeyboardInterrupt:
-    print("\n⏹️  Processing interrupted by user")
-    sys.exit(0)
-except Exception as e:
-    print(f"\n❌ Error: {e}")
-    print("\n🔧 Troubleshooting:")
-    if config.get("use_kotoba_whisper", False):
-        print("   🇯🇵 Kotoba-whisper specific:")
-        print("      • Ensure stable internet for first-time download")
-        print("      • Check disk space (model ~1-3GB)")
-        print("      • Try disabling kotoba temporarily: use_kotoba_whisper: false")
-    print("   • Install scipy for advanced features: pip install scipy")
-    print("   • Check audio quality and volume levels")
-    print("   • Try adjusting VAD threshold in config")
-    print("   • Enable conservative_timing_mode in config")
-    if args.batch:
-        print("   • Check batch folder configuration and permissions")
-        print("   • Review batch processing log for detailed errors")
-    sys.exit(1)
-    _background_noise
-    ', True) else '
-    DISABLED
-    '}")
-
-# Initialize transcriber
-transcriber = WhisperTranscriber(config)
-
-# Rest of main() function remains the same...
-try:
-    # Check if batch mode is requested
-    if args.batch and args.batch.lower() in ['y', 'yes']:
-        print("\n📦 BATCH PROCESSING MODE")
-        print("=" * 50)
-
-        # Initialize batch processor
-        batch_processor = BatchProcessor(transcriber, config)
-
-        # Show batch configuration
-        print(f"📁 Batch folder: {config.get('batch_folder', 'Not configured')}")
-        print(f"✅ Processed folder: {config.get('batch_processed_folder', 'Not configured')}")
-        print(f"❌ Failed folder: {config.get('batch_failed_folder', 'Not configured')}")
-        print(f"📋 Log file: {config.get('batch_log_file', 'Not configured')}")
-        print(f"⏭️  Skip existing: {'YES' if config.get('batch_skip_existing_srt', True) else 'NO'}")
-        print(f"📁 Move processed: {'YES' if config.get('batch_move_processed_files', True) else 'NO'}")
-        print(f"🔄 Continue on error: {'YES' if config.get('batch_continue_on_error', True) else 'NO'}")
-
-        # Process batch
-        stats = batch_processor.process_batch()
-
-        # Show final results
-        print("\n" + "=" * 50)
-        print("📊 BATCH PROCESSING RESULTS:")
-        print(f"   ✅ Successful: {stats['success']}")
-        print(f"   ⏭️ Skipped: {stats['skipped']}")
-        print(f"   ❌ Failed: {stats['failed']}")
-        print(f"   📁 Total: {stats['total']}")
-
-        if stats['success'] > 0:
-            print(f"\n🎉 Batch processing completed! {stats['success']} files transcribed successfully.")
-        else:
-            print(f"\n⚠️  No files were successfully transcribed.")
-
-    else:
-        # Single file mode
-        if not args.filename:
-            print("❌ Error: No filename provided for single file mode")
-            print("Usage: python transcribe7.py [filename] or python transcribe7.py --batch=y")
-            sys.exit(1)
-
-        print(f"\n📄 SINGLE FILE MODE")
-        print("=" * 50)
-
-        result = transcriber.transcribe_file(args.filename)
-        print(f"\n🎉 Success! Enhanced transcription saved: {result}")
-        print("\n💡 Enhanced features applied:")
-        if config.get("use_kotoba_whisper", False):
-            print("   🇯🇵 Kotoba-whisper Japanese speech optimization")
-            print("   📈 Enhanced Japanese phoneme detection")
-        print("   🎵 MP3 audio boosting for better transcription")
-        print("   🎚️  Audio normalization and compression")
-        print("   ✨ High-frequency emphasis for speech clarity")
-        print("   🎯 Accurate speech detection and timestamps")
-        print("   🚫 Background noise and silence filtering")
-
-except KeyboardInterrupt:
-    print("\n⏹️  Processing interrupted by user")
-    sys.exit(0)
-except Exception as e:
-    print(f"\n❌ Error: {e}")
-    print("\n🔧 Troubleshooting:")
-    print("   • Install scipy for advanced features: pip install scipy")
-    print("   • Check audio quality and volume levels")
-    print("   • Try adjusting VAD threshold in config")
-    print("   • Enable conservative_timing_mode in config")
-    if args.batch:
-        print("   • Check batch folder configuration and permissions")
-        print("   • Review batch processing log for detailed errors")
-    sys.exit(1)
 
 if __name__ == "__main__":
     main()
