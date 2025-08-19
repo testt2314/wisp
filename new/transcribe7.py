@@ -1,25 +1,4 @@
 #!/usr/bin/env python3
-"""
-Whisper Transcription Tool for Mac mini - ENHANCED WITH ACCURATE TIMESTAMP DETECTION
-Fixes issue where subtitles appear during silence/background noise
-This is with batch processing
-Usage: python transcribe.py [file] [--batch=y|n]
-
-
-KEY IMPROVEMENTS FOR ACCURATE TIMESTAMPS:
-- Enhanced VAD (Voice Activity Detection) to ignore background noise
-- Audio energy analysis to detect actual speech vs silence
-- Conservative timestamp validation
-- Spectral analysis for speech detection
-- Word-level confidence filtering
-- Silence gap detection and removal
-
-Requirements:
-- For regular Whisper: pip install transformers torch librosa
-- For faster-whisper: pip install faster-whisper librosa scipy
-- THIS IS THE FINAL WORKING CODE BEFORE MOVE INTO BATCH PROCESSING
-"""
-
 import os
 import sys
 import json
@@ -82,123 +61,6 @@ except ImportError:
     SCIPY_AVAILABLE = False
     print("⚠️  scipy not available. Install for better speech detection: pip install scipy")
 
-CONFIG = {
-    "srt_location": "/Volumes/Macintosh HD/Downloads/srt",
-    "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
-    "audio_source": "/Volumes/Macintosh HD/Downloads",
-    "video_source": "/Volumes/Macintosh HD/Downloads/Video/uc",
-    "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",
-    "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
-    "ffmpeg_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
-    "ffprobe_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
-    "model_size": "openai/whisper-large-v3",
-    "chunk_length_s": 30,
-    "vad_threshold": 0.02,
-    "chunk_duration": 20.0,
-    "credit": "Created using Whisper Transcription Tool",
-    "use_mps": True,
-    "save_audio_to_export_location": True,
-    "use_faster_whisper": True,
-
-    # ==== BATCH PROCESSING SETTINGS ====
-    "batch_folder": "/Volumes/Macintosh HD/Downloads/batch_audio",
-    "batch_processed_folder": "/Volumes/Macintosh HD/Downloads/batch_audio/processed",
-    "batch_failed_folder": "/Volumes/Macintosh HD/Downloads/batch_audio/failed",
-    "batch_log_file": "/Volumes/Macintosh HD/Downloads/srt/batch_processing.log",
-    "batch_skip_existing_srt": True,
-    "batch_move_processed_files": True,
-    "batch_continue_on_error": True,
-
-    # ==== MODEL SETTINGS ====
-    "faster_whisper_model_size": "large-v3",
-    "faster_whisper_local_model_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--Systran--faster-whisper-large-v3",
-    "faster_whisper_compute_type": "int8_float16",
-    "faster_whisper_device": "auto",
-    "faster_whisper_cpu_threads": 8,
-    "faster_whisper_num_workers": 1,
-
-    # ==== NEW KOTOBA WHISPER SETTINGS ====
-    "use_kotoba_whisper": False,  # NEW: Enable kotoba-whisper model
-    "kotoba_whisper_model_name": "kotoba-tech/kotoba-whisper-v1.0",  # NEW: Kotoba model name
-    "kotoba_whisper_local_path": "/Volumes/Macintosh HD/Downloads/srt/whisper_models/models--kotoba-tech--kotoba-whisper-v1.0",
-    # NEW: Local path
-
-    "faster_whisper_compute_type": "int8_float16",
-    "faster_whisper_device": "auto",
-    "faster_whisper_cpu_threads": 8,
-    "faster_whisper_num_workers": 1,
-
-    # ==== TRANSCRIPTION QUALITY SETTINGS ====
-    "faster_whisper_beam_size": 5,
-    "faster_whisper_best_of": 2,
-    "faster_whisper_patience": 1.5,
-    "faster_whisper_temperature": [0.0, 0.2, 0.4, 0.6, 0.8],
-
-    # ==== ANTI-REPETITION SETTINGS ====
-    "faster_whisper_length_penalty": 1.0,
-    "faster_whisper_repetition_penalty": 1.15,
-    "faster_whisper_no_repeat_ngram_size": 5,
-    "faster_whisper_suppress_blank": False,
-    "faster_whisper_suppress_tokens": [-1],
-
-    # ==== ENHANCED VAD SETTINGS FOR ACCURATE SPEECH DETECTION ====
-    "faster_whisper_vad_filter": True,
-    "faster_whisper_vad_threshold": 0.15,  # INCREASED: More conservative to avoid false positives
-    "faster_whisper_min_silence_duration_ms": 500,  # INCREASED: Longer silence required
-    "faster_whisper_max_speech_duration_s": 30,  # REDUCED: Shorter segments
-    "faster_whisper_min_speech_duration_ms": 100,  # INCREASED: Minimum speech length
-
-    # ==== SPEECH DETECTION THRESHOLDS - NEW SECTION ====
-    "speech_energy_threshold": 0.008,  # Minimum energy for speech detection
-    "speech_spectral_centroid_min": 300,  # Minimum spectral centroid for speech (Hz)
-    "speech_spectral_centroid_max": 3500,  # Maximum spectral centroid for speech (Hz)
-    "speech_zero_crossing_rate_min": 0.01,  # Minimum ZCR for speech
-    "speech_zero_crossing_rate_max": 0.35,  # Maximum ZCR for speech
-    "word_confidence_threshold": 0.4,  # INCREASED: Higher confidence required
-    "segment_confidence_threshold": 0.35,  # INCREASED: Higher segment confidence
-    "enable_advanced_speech_detection": True,  # Enable spectral analysis
-    "conservative_timing_mode": True,  # Enable conservative timestamp validation
-
-    # ==== TIMESTAMP ACCURACY SETTINGS - NEW SECTION ====
-    "timestamp_validation_enabled": True,  # Validate timestamps against audio energy
-    "timestamp_energy_window_ms": 100,  # Window size for energy analysis (ms)
-    "timestamp_buffer_start_ms": 200,  # Buffer before actual speech start (ms)
-    "timestamp_buffer_end_ms": 100,  # Buffer after actual speech end (ms)
-    "silence_gap_threshold_ms": 800,  # Minimum gap to consider separate segments
-    "merge_close_segments": True,  # Merge segments separated by short gaps
-    "max_segment_gap_ms": 400,  # Maximum gap to merge segments
-
-    # ==== NOISE FILTERING SETTINGS ====
-    "filter_background_noise": True,  # Enable background noise detection
-    "background_noise_duration_threshold": 2.0,  # Min duration to consider background noise
-    "noise_to_speech_ratio_threshold": 0.3,  # Max ratio of noise energy to speech energy
-
-    # ==== JAPANESE TO ENGLISH ====
-    "faster_whisper_force_language": "ja",
-    "faster_whisper_initial_prompt": None,
-    "faster_whisper_task": "translate",
-
-    # ==== AUDIO PROCESSING ====
-    "audio_minimal_preprocessing": False,
-    "audio_keep_original_format": True,
-    "audio_whisper_boost_enabled": True,
-    "audio_dynamic_range_compression": True,
-    "audio_spectral_gating": True,
-
-    # ==== MP3 TRANSCRIPTION BOOST SETTINGS - NEW ====
-    "enable_mp3_transcription_boost": True,  # Enable MP3-specific boosting
-    "mp3_boost_factor": 8.0,  # Boost factor specifically for MP3 files
-    "mp3_normalize_audio": True,  # Normalize MP3 audio before transcription
-    "mp3_target_rms": 0.15,  # Target RMS level for MP3 normalization
-    "mp3_compression_boost": True,  # Apply compression for MP3
-    "mp3_high_freq_boost": True,  # Boost high frequencies for clarity
-
-    # ==== SOFT AUDIO DETECTION THRESHOLDS ====
-    "soft_audio_rms_threshold": 0.008,  # Slightly increased for MP3
-    "soft_audio_max_threshold": 0.025,  # Slightly increased for MP3
-    "whisper_boost_factor": 15.0,  # Increased from 12.0
-    "dynamic_compression_ratio": 4.0,
-}
 
 # Global constants
 v_config = "config3_1.json"
@@ -207,20 +69,6 @@ TQDM_FORMAT = "{desc}: {percentage:3.1f}% |{bar}| {n:.2f}/{total:.2f} [{elapsed}
 # Garbage patterns to remove from transcriptions
 GARBAGE_PATTERNS = [
     "Thank you.",
-    "Thanks for watching.",
-    "Please subscribe.",
-    "Don't forget to like and subscribe.",
-    "See you next time.",
-    "Bye bye.",
-    "[moan]",
-    "Mmm",
-    "Ahh",
-    "Uhh",
-    "♪",  # Music notes
-    "(music)",
-    "[music]",
-    "(background music)",
-    "[background music]"
 ]
 
 REMOVE_QUOTES = dict.fromkeys(map(ord, '"„"‟"＂「」'), None)
