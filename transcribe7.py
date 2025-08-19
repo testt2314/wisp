@@ -190,7 +190,7 @@ CONFIG = {
 }
 
 # Global constants
-v_config = "config3_1.json"
+v_config = "config3.json"
 TQDM_FORMAT = "{desc}: {percentage:3.1f}% |{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate:.2f} audio s / real time s]"
 
 # Garbage patterns to remove from transcriptions
