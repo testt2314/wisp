@@ -148,15 +148,6 @@ CONFIG = {
     "enable_advanced_speech_detection": True,  # Enable spectral analysis
     "conservative_timing_mode": True,  # Enable conservative timestamp validation
 
-    # ==== LOW CONFIDENCE SEGMENT CONTROL - NEW SECTION ====
-    "enable_confidence_filtering": True,  # Master switch for confidence filtering
-    "allow_low_confidence_segments": False,  # Allow segments with low confidence
-    "low_confidence_word_threshold": 0.2,  # Lower threshold for "low confidence" words
-    "low_confidence_segment_threshold": 0.25,  # Lower threshold for "low confidence" segments
-    "min_high_confidence_words_ratio": 0.3,  # Minimum ratio of high-conf words in segment (0.0-1.0)
-    "confidence_filtering_mode": "strict",  # "strict", "moderate", "lenient", "disabled"
-    "log_filtered_segments": True,  # Log filtered segments for debugging
-
     # ==== TIMESTAMP ACCURACY SETTINGS - NEW SECTION ====
     "timestamp_validation_enabled": True,  # Validate timestamps against audio energy
     "timestamp_energy_window_ms": 100,  # Window size for energy analysis (ms)
@@ -199,7 +190,7 @@ CONFIG = {
 }
 
 # Global constants
-v_config = "config3.json"
+v_config = "config3_1.json"
 TQDM_FORMAT = "{desc}: {percentage:3.1f}% |{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate:.2f} audio s / real time s]"
 
 # Garbage patterns to remove from transcriptions
@@ -1864,117 +1855,58 @@ class WhisperTranscriber:
             last_end_time = 0.0
             segment_count = 0
             filtered_count = 0
+            word_confidence_threshold = self.config.get("word_confidence_threshold", 0.4)
+            segment_confidence_threshold = self.config.get("segment_confidence_threshold", 0.35)
+            enable_confidence_filtering = self.config.get("enable_confidence_filtering", True)
+            enable_text = self.config.get("enable_text", True)
+            for segment in segments_generator:
+                segment_count += 1
+                text = segment.text.strip() if hasattr(segment, 'text') else ""
+                if not text or len(text) < 2:
+                    filtered_count += 1
+                    continue
+                if hasattr(segment, 'words') and segment.words and enable_confidence_filtering:
+                    high_conf_words = [w for w in segment.words if
+                                       w.word.strip() and w.probability >= word_confidence_threshold]
+                    if not high_conf_words:
+                        if enable_text:
+                            print(f"   ❌ Filtered low-confidence segment: '{text[:30]}...' (no high-conf words)")
 
-    def _apply_confidence_filtering(self, segment, segment_count: int, filtered_count: int) -> tuple[bool, int, str]:
-        """Apply confidence filtering based on configuration with multiple modes."""
-        text = segment.text.strip() if hasattr(segment, 'text') else ""
+                        filtered_count += 1
+                        continue
+                    avg_confidence = np.mean([w.probability for w in high_conf_words])
+                    if avg_confidence < segment_confidence_threshold:
+                        if enable_text:
+                            print(f"   ❌ Filtered low-confidence segment: '{text[:30]}...' (conf: {avg_confidence:.2f})")
 
-        # Check if confidence filtering is enabled
-        if not self.config.get("enable_confidence_filtering", True):
-            return True, filtered_count, "confidence filtering disabled"
-
-        # Get confidence filtering mode
-        filtering_mode = self.config.get("confidence_filtering_mode", "strict").lower()
-
-        if filtering_mode == "disabled":
-            return True, filtered_count, "filtering mode disabled"
-
-        # Check if we have word-level confidence data
-        if not (hasattr(segment, 'words') and segment.words):
-            # No word-level data - use lenient approach
-            if self.config.get("allow_low_confidence_segments", False):
-                return True, filtered_count, "no word data, allowing segment"
-            else:
-                return True, filtered_count, "no word data, keeping segment"
-
-        # Get thresholds based on mode
-        word_threshold, segment_threshold, min_ratio = self._get_confidence_thresholds(filtering_mode)
-
-        # Analyze word confidences
-        all_words = [w for w in segment.words if w.word.strip()]
-        if not all_words:
-            return False, filtered_count + 1, "no valid words"
-
-        # Calculate confidence statistics
-        word_confidences = [w.probability for w in all_words]
-        avg_confidence = np.mean(word_confidences)
-        high_conf_words = [w for w in all_words if w.probability >= word_threshold]
-        high_conf_ratio = len(high_conf_words) / len(all_words) if all_words else 0
-
-        # Apply filtering logic based on mode
-        should_keep, reason = self._evaluate_segment_confidence(
-            filtering_mode, avg_confidence, segment_threshold,
-            high_conf_ratio, min_ratio, len(high_conf_words), text
-        )
-
-        if not should_keep:
-            if self.config.get("log_filtered_segments", True):
-                print(f"   ❌ Filtered segment: '{text[:30]}...' ({reason})")
-            return False, filtered_count + 1, reason
-        else:
-            confidence_info = f"avg: {avg_confidence:.2f}, high-conf: {len(high_conf_words)}/{len(all_words)}"
-            print(f"   ✅ Kept segment: {confidence_info}, '{text[:30]}...'")
-            return True, filtered_count, f"kept ({reason})"
-
-    def _get_confidence_thresholds(self, filtering_mode: str) -> tuple[float, float, float]:
-        """Get confidence thresholds based on filtering mode."""
-        if filtering_mode == "strict":
-            word_threshold = self.config.get("word_confidence_threshold", 0.4)
-            segment_threshold = self.config.get("segment_confidence_threshold", 0.35)
-            min_ratio = self.config.get("min_high_confidence_words_ratio", 0.3)
-        elif filtering_mode == "moderate":
-            word_threshold = max(0.25, self.config.get("word_confidence_threshold", 0.4) * 0.75)
-            segment_threshold = max(0.2, self.config.get("segment_confidence_threshold", 0.35) * 0.75)
-            min_ratio = max(0.2, self.config.get("min_high_confidence_words_ratio", 0.3) * 0.7)
-        elif filtering_mode == "lenient":
-            word_threshold = self.config.get("low_confidence_word_threshold", 0.2)
-            segment_threshold = self.config.get("low_confidence_segment_threshold", 0.25)
-            min_ratio = 0.1  # Very low requirement
-        else:  # fallback to moderate
-            word_threshold = 0.3
-            segment_threshold = 0.25
-            min_ratio = 0.2
-
-        return word_threshold, segment_threshold, min_ratio
-
-    def _evaluate_segment_confidence(self, filtering_mode: str, avg_confidence: float,
-                                     segment_threshold: float, high_conf_ratio: float,
-                                     min_ratio: float, high_conf_count: int, text: str) -> tuple[bool, str]:
-        """Evaluate whether to keep a segment based on confidence metrics."""
-
-        if filtering_mode == "strict":
-            # Strict: Need both good average confidence AND sufficient high-confidence words
-            if avg_confidence < segment_threshold:
-                return False, f"low avg confidence: {avg_confidence:.2f} < {segment_threshold:.2f}"
-            if high_conf_ratio < min_ratio:
-                return False, f"insufficient high-conf words: {high_conf_ratio:.2f} < {min_ratio:.2f}"
-            if high_conf_count == 0:
-                return False, "no high-confidence words"
-            return True, f"strict: avg={avg_confidence:.2f}, ratio={high_conf_ratio:.2f}"
-
-        elif filtering_mode == "moderate":
-            # Moderate: More forgiving, allow if either condition is reasonably met
-            if avg_confidence >= segment_threshold and high_conf_ratio >= min_ratio:
-                return True, f"moderate: both conditions met"
-            elif avg_confidence >= segment_threshold * 0.8 and high_conf_count >= 1:
-                return True, f"moderate: decent avg + some high-conf words"
-            elif high_conf_ratio >= min_ratio * 1.5:
-                return True, f"moderate: good high-conf ratio"
-            else:
-                return False, f"moderate: avg={avg_confidence:.2f}, ratio={high_conf_ratio:.2f}"
-
-        elif filtering_mode == "lenient":
-            # Lenient: Keep most segments unless they're clearly problematic
-            if high_conf_count == 0 and avg_confidence < 0.15:
-                return False, f"lenient: no high-conf words and very low avg: {avg_confidence:.2f}"
-            elif len(text.strip()) < 3 and avg_confidence < 0.2:
-                return False, f"lenient: very short text and low confidence"
-            else:
-                return True, f"lenient: keeping segment"
-
-        else:
-            # Default behavior
-            return True, "unknown mode, keeping segment"
+                        filtered_count += 1
+                        continue
+                    start = max(float(high_conf_words[0].start) - 0.1, float(segment.start))
+                    end = min(float(high_conf_words[-1].end) + 0.1, float(segment.end))
+                    if enable_text:
+                        print(
+                            f"   ✅ High-conf segment: {start:.2f}-{end:.2f}, conf: {avg_confidence:.2f}, '{text[:30]}...'")
+                else:
+                    start = float(segment.start)
+                    end = float(segment.end)
+                    if enable_text:
+                        print(
+                            f"   ⚠️ No word timestamps or confidence filtering disabled: {start:.2f}-{end:.2f}, '{text[:30]}...'")
+                if start < last_end_time:
+                    start = last_end_time + 0.1
+                    if end <= start:
+                        end = start + 0.5
+                if end - start < 0.2 or end - start > 30.0:
+                    filtered_count += 1
+                    continue
+                chunk_data = {
+                    "text": text,
+                    "timestamp": [start, end]
+                }
+                chunks.append(chunk_data)
+                last_end_time = end
+                progress = min(100.0, (last_end_time / audio_duration) * 100) if audio_duration > 0 else 0
+                self._update_progress(progress)
             self._update_progress(100.0)
             print(f"\n✅ Processing complete: {len(chunks)} valid segments, {filtered_count} filtered")
             if len(chunks) == 0:
@@ -1989,168 +1921,166 @@ class WhisperTranscriber:
                 "chunks": chunks
             }
         except Exception as e:
-        print(f"\n❌ faster-whisper error: {e}")
-        return {
-            "text": "Transcription completed with fallback.",
-            "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
-        }
-
-
-def _transcribe_with_hf(self, audio_data: Dict[str, Any]) -> Dict[str, Any]:
-    """Transcribe using HuggingFace Transformers Whisper."""
-    if self.pipe is None:
-        raise RuntimeError("HF Transformers model is not loaded")
-
-    print("🚀 Starting HF Transformers transcription...")
-
-    try:
-        result = self.pipe(
-            audio_data["array"],
-            return_timestamps=True,
-            generate_kwargs={
-                "task": "translate" if self.config.get("faster_whisper_task") == "translate" else "transcribe",
-                "language": self.config.get("faster_whisper_force_language"),
+            print(f"\n❌ faster-whisper error: {e}")
+            return {
+                "text": "Transcription completed with fallback.",
+                "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
             }
-        )
 
-        # Process HF results
-        chunks = []
-        if isinstance(result.get("chunks"), list):
-            for chunk in result["chunks"]:
-                chunks.append({
-                    "text": chunk.get("text", ""),
-                    "timestamp": chunk.get("timestamp", [0.0, 1.0])
-                })
-        else:
-            # Fallback for non-chunked results
-            chunks = [{
-                "text": result.get("text", ""),
-                "timestamp": [0.0, len(audio_data["array"]) / audio_data["sampling_rate"]]
-            }]
+    def _transcribe_with_hf(self, audio_data: Dict[str, Any]) -> Dict[str, Any]:
+        """Transcribe using HuggingFace Transformers Whisper."""
+        if self.pipe is None:
+            raise RuntimeError("HF Transformers model is not loaded")
 
-        full_text = result.get("text", "")
-        return {
-            "text": full_text,
-            "chunks": chunks
-        }
-
-    except Exception as e:
-        print(f"❌ HF Transformers error: {e}")
-        return {
-            "text": "Transcription completed with fallback.",
-            "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
-        }
-
-
-def transcribe_file(self, file_path: str) -> str:
-    """Main transcription function with enhanced speech detection for accurate timestamps."""
-    actual_file_path = self._find_input_file(file_path)
-
-    if not os.path.exists(actual_file_path):
-        raise FileNotFoundError(f"File not found: {actual_file_path}")
-
-    self._load_model()
-
-    # Determine file type and prepare audio file
-    audio_path = actual_file_path
-    temp_audio = False
-
-    if self._is_video_file(actual_file_path):
-        print("Video file detected, converting to audio...")
-        audio_path, temp_audio = self._convert_to_audio(actual_file_path)
-    elif not self._is_audio_file(actual_file_path):
-        raise ValueError(f"Unsupported file type: {Path(actual_file_path).suffix}")
-
-    try:
-        # Generate output filename
-        base_name = Path(actual_file_path).stem
-        srt_path = os.path.join(self.config["srt_location"], f"{base_name}.srt")
-
-        print(f"📁 Input: {audio_path}")
-        print(f"📄 Output: {srt_path}")
-        print(f"🔧 Engine: {'faster-whisper' if self.use_faster_whisper else 'HF Transformers'}")
-        print(f"🎯 Features: Enhanced Speech Detection + Accurate Timestamps")
-
-        # Load audio with enhanced preprocessing
-        audio_data = self._load_audio(audio_path)
-        audio_duration = len(audio_data["array"]) / audio_data["sampling_rate"]
-        print(f"⏱️  Duration: {audio_duration:.1f}s")
-
-        # Run enhanced transcription with speech detection
-        start_time = time.time()
-        self.transcription_complete = False
+        print("🚀 Starting HF Transformers transcription...")
 
         try:
-            if self.use_faster_whisper:
-                result = self._transcribe_with_faster_whisper(audio_data, audio_duration)
+            result = self.pipe(
+                audio_data["array"],
+                return_timestamps=True,
+                generate_kwargs={
+                    "task": "translate" if self.config.get("faster_whisper_task") == "translate" else "transcribe",
+                    "language": self.config.get("faster_whisper_force_language"),
+                }
+            )
+
+            # Process HF results
+            chunks = []
+            if isinstance(result.get("chunks"), list):
+                for chunk in result["chunks"]:
+                    chunks.append({
+                        "text": chunk.get("text", ""),
+                        "timestamp": chunk.get("timestamp", [0.0, 1.0])
+                    })
             else:
-                result = self._transcribe_with_hf(audio_data)
-        finally:
-            self.transcription_complete = True
-            elapsed = time.time() - start_time
-            mins, secs = divmod(elapsed, 60)
-            completion_time = f"Completed in {int(mins):02d}:{int(secs):02d}"
-            print(f"\n⏱️  {completion_time}")
+                # Fallback for non-chunked results
+                chunks = [{
+                    "text": result.get("text", ""),
+                    "timestamp": [0.0, len(audio_data["array"]) / audio_data["sampling_rate"]]
+                }]
 
-            # Calculate speed ratio
-            speed_ratio = audio_duration / elapsed if elapsed > 0 else 0
-            print(f"🚀 Speed: {speed_ratio:.2f}x real-time")
+            full_text = result.get("text", "")
+            return {
+                "text": full_text,
+                "chunks": chunks
+            }
 
-        # Process results
-        chunks = result.get("chunks", [])
-        if not chunks:
-            chunks = [{
-                "text": result.get("text", "Transcription completed."),
-                "timestamp": [0.0, audio_duration]
-            }]
+        except Exception as e:
+            print(f"❌ HF Transformers error: {e}")
+            return {
+                "text": "Transcription completed with fallback.",
+                "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
+            }
 
-        print(f"📝 Generated {len(chunks)} raw segments")
+    def transcribe_file(self, file_path: str) -> str:
+        """Main transcription function with enhanced speech detection for accurate timestamps."""
+        actual_file_path = self._find_input_file(file_path)
 
-        # Convert to SRT
-        subs = self._convert_timestamps_to_srt(chunks, audio_duration)
-        if not subs:
-            subs = [srt.Subtitle(
-                index=1,
-                start=timedelta(seconds=0),
-                end=timedelta(seconds=min(5, audio_duration)),
-                content="No speech detected in audio."
-            )]
+        if not os.path.exists(actual_file_path):
+            raise FileNotFoundError(f"File not found: {actual_file_path}")
 
-        # Enhanced cleaning with speech detection
-        cleaned_subs = self._clean_srt_segments(subs, audio_data["array"], audio_data["sampling_rate"])
-        if not cleaned_subs:
-            # Fallback if all segments were filtered
-            cleaned_subs = [srt.Subtitle(
-                index=1,
-                start=timedelta(seconds=0),
-                end=timedelta(seconds=min(3, audio_duration)),
-                content="Audio processed - minimal speech detected."
-            )]
+        self._load_model()
 
-        # Write SRT file
-        with open(srt_path, 'w', encoding='utf-8') as f:
-            f.write(srt.compose(cleaned_subs))
+        # Determine file type and prepare audio file
+        audio_path = actual_file_path
+        temp_audio = False
 
-        # Add credits
-        self._add_credit_to_srt(srt_path, self.config["credit"])
-        self._add_credit_to_srt(srt_path, completion_time)
+        if self._is_video_file(actual_file_path):
+            print("Video file detected, converting to audio...")
+            audio_path, temp_audio = self._convert_to_audio(actual_file_path)
+        elif not self._is_audio_file(actual_file_path):
+            raise ValueError(f"Unsupported file type: {Path(actual_file_path).suffix}")
 
-        print(f"✅ Success! Enhanced SRT saved with {len(cleaned_subs)} accurate segments")
-        print(f"🎯 Features used: Advanced VAD, Speech Detection, Timestamp Validation")
+        try:
+            # Generate output filename
+            base_name = Path(actual_file_path).stem
+            srt_path = os.path.join(self.config["srt_location"], f"{base_name}.srt")
 
-        if not temp_audio:
-            print(f"📁 Audio saved: {audio_path}")
+            print(f"📁 Input: {audio_path}")
+            print(f"📄 Output: {srt_path}")
+            print(f"🔧 Engine: {'faster-whisper' if self.use_faster_whisper else 'HF Transformers'}")
+            print(f"🎯 Features: Enhanced Speech Detection + Accurate Timestamps")
 
-        return srt_path
+            # Load audio with enhanced preprocessing
+            audio_data = self._load_audio(audio_path)
+            audio_duration = len(audio_data["array"]) / audio_data["sampling_rate"]
+            print(f"⏱️  Duration: {audio_duration:.1f}s")
 
-    finally:
-        # Cleanup temporary files
-        if temp_audio and os.path.exists(audio_path):
+            # Run enhanced transcription with speech detection
+            start_time = time.time()
+            self.transcription_complete = False
+
             try:
-                os.remove(audio_path)
-                print(f"🗑️  Cleaned up: {audio_path}")
-            except OSError:
-                pass
+                if self.use_faster_whisper:
+                    result = self._transcribe_with_faster_whisper(audio_data, audio_duration)
+                else:
+                    result = self._transcribe_with_hf(audio_data)
+            finally:
+                self.transcription_complete = True
+                elapsed = time.time() - start_time
+                mins, secs = divmod(elapsed, 60)
+                completion_time = f"Completed in {int(mins):02d}:{int(secs):02d}"
+                print(f"\n⏱️  {completion_time}")
+
+                # Calculate speed ratio
+                speed_ratio = audio_duration / elapsed if elapsed > 0 else 0
+                print(f"🚀 Speed: {speed_ratio:.2f}x real-time")
+
+            # Process results
+            chunks = result.get("chunks", [])
+            if not chunks:
+                chunks = [{
+                    "text": result.get("text", "Transcription completed."),
+                    "timestamp": [0.0, audio_duration]
+                }]
+
+            print(f"📝 Generated {len(chunks)} raw segments")
+
+            # Convert to SRT
+            subs = self._convert_timestamps_to_srt(chunks, audio_duration)
+            if not subs:
+                subs = [srt.Subtitle(
+                    index=1,
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=min(5, audio_duration)),
+                    content="No speech detected in audio."
+                )]
+
+            # Enhanced cleaning with speech detection
+            cleaned_subs = self._clean_srt_segments(subs, audio_data["array"], audio_data["sampling_rate"])
+            if not cleaned_subs:
+                # Fallback if all segments were filtered
+                cleaned_subs = [srt.Subtitle(
+                    index=1,
+                    start=timedelta(seconds=0),
+                    end=timedelta(seconds=min(3, audio_duration)),
+                    content="Audio processed - minimal speech detected."
+                )]
+
+            # Write SRT file
+            with open(srt_path, 'w', encoding='utf-8') as f:
+                f.write(srt.compose(cleaned_subs))
+
+            # Add credits
+            self._add_credit_to_srt(srt_path, self.config["credit"])
+            self._add_credit_to_srt(srt_path, completion_time)
+
+            print(f"✅ Success! Enhanced SRT saved with {len(cleaned_subs)} accurate segments")
+            print(f"🎯 Features used: Advanced VAD, Speech Detection, Timestamp Validation")
+
+            if not temp_audio:
+                print(f"📁 Audio saved: {audio_path}")
+
+            return srt_path
+
+        finally:
+            # Cleanup temporary files
+            if temp_audio and os.path.exists(audio_path):
+                try:
+                    os.remove(audio_path)
+                    print(f"🗑️  Cleaned up: {audio_path}")
+                except OSError:
+                    pass
 
 
 def load_config(config_file: str = v_config) -> Dict[str, Any]:
@@ -2236,23 +2166,6 @@ def main():
     print(f"🔍 Speech Analysis: {'ENABLED' if config.get('enable_advanced_speech_detection', True) else 'DISABLED'}")
     print(f"⏱️  Timestamp Validation: {'ENABLED' if config.get('timestamp_validation_enabled', True) else 'DISABLED'}")
     print(f"🚫 Noise Filtering: {'ENABLED' if config.get('filter_background_noise', True) else 'DISABLED'}")
-
-    # Show confidence filtering settings
-    confidence_mode = config.get("confidence_filtering_mode", "strict")
-    confidence_enabled = config.get("enable_confidence_filtering", True)
-    if confidence_enabled:
-        print(f"🎭 Confidence Filtering: {confidence_mode.upper()} mode")
-        if confidence_mode == "strict":
-            word_thresh = config.get("word_confidence_threshold", 0.4)
-            seg_thresh = config.get("segment_confidence_threshold", 0.35)
-            print(f"   📊 Word threshold: {word_thresh}, Segment threshold: {seg_thresh}")
-        elif confidence_mode == "lenient":
-            word_thresh = config.get("low_confidence_word_threshold", 0.2)
-            seg_thresh = config.get("low_confidence_segment_threshold", 0.25)
-            print(f"   📊 Low-confidence thresholds: Word={word_thresh}, Segment={seg_thresh}")
-        print(f"   🔄 Allow low-confidence: {'YES' if config.get('allow_low_confidence_segments', False) else 'NO'}")
-    else:
-        print(f"🎭 Confidence Filtering: DISABLED")
 
     # Initialize transcriber
     transcriber = WhisperTranscriber(config)
