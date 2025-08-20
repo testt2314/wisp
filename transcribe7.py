@@ -1848,7 +1848,7 @@ class WhisperTranscriber:
                 no_speech_threshold=0.4,
                 log_prob_threshold=-2.5,
                 compression_ratio_threshold=2.4,
-                word_timestamps=True
+                word_timestamps=self.config.get("faster_whisper_word_timestamps",True)
             )
             print(f"📊 Language: {info.language} (confidence: {info.language_probability:.2f})")
             chunks = []
