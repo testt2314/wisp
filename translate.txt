@@ -1,0 +1,36 @@
+def load_translation_model(model_name: str, local_path: Path):
+    """
+    Loads a translation model from a local path.
+    """
+    local_path.mkdir(parents=True, exist_ok=True)
+    logging.info(f"Checking for translation model '{model_name}' in local path: {local_path}")
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(model_name, cache_dir=str(local_path))
+        model = AutoModelForSeq2SeqLM.from_pretrained(model_name, cache_dir=str(local_path))
+        logging.info(f"Successfully loaded {model_name}.")
+        return pipeline("translation_ja_to_en", model=model, tokenizer=tokenizer)
+    except Exception as e:
+        logging.error(f"Failed to download or load translation model '{model_name}': {e}")
+        sys.exit(1)
+
+
+def translate_japanese_to_english_local(text: str, translator):
+    """
+    Translates Japanese text to English using a local model from Hugging Face Transformers.
+
+    Args:
+        text (str): The Japanese text to translate.
+        translator: The loaded translation pipeline.
+
+    Returns:
+        str: The translated English text, or an error message if it fails.
+    """
+    try:
+        logging.info("Starting translation...")
+        result = translator(text)
+        translated_text = result[0]['translation_text']
+        logging.info("Translation completed.")
+        return translated_text.strip()
+    except Exception as e:
+        logging.error(f"An error occurred during local translation: {e}")
+        return f"Error: Local translation failed. {e}"
