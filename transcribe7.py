@@ -5,7 +5,6 @@ Fixes issue where subtitles appear during silence/background noise
 This is with batch processing
 Usage: python transcribe.py [file] [--batch=y|n]
 
-
 KEY IMPROVEMENTS FOR ACCURATE TIMESTAMPS:
 - Enhanced VAD (Voice Activity Detection) to ignore background noise
 - Audio energy analysis to detect actual speech vs silence
@@ -13,11 +12,6 @@ KEY IMPROVEMENTS FOR ACCURATE TIMESTAMPS:
 - Spectral analysis for speech detection
 - Word-level confidence filtering
 - Silence gap detection and removal
-
-Requirements:
-- For regular Whisper: pip install transformers torch librosa
-- For faster-whisper: pip install faster-whisper librosa scipy
-- THIS IS THE FINAL WORKING CODE BEFORE MOVE INTO BATCH PROCESSING
 """
 
 import os
@@ -35,7 +29,6 @@ import torch
 import librosa
 import numpy as np
 import time
-import threading
 import warnings
 import argparse
 import glob
@@ -48,24 +41,14 @@ warnings.filterwarnings("ignore", message="invalid value encountered in matmul")
 # Try to import psutil for CPU detection
 try:
     import psutil
-
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
     print("Note: Install psutil for automatic CPU thread detection: pip install psutil")
 
-# Try to import both whisper implementations
-try:
-    from transformers import pipeline
-
-    HF_AVAILABLE = True
-except ImportError:
-    HF_AVAILABLE = False
-    print("Warning: transformers not available. Install with: pip install transformers")
-
+# Try to import faster-whisper
 try:
     from faster_whisper import WhisperModel
-
     FASTER_WHISPER_AVAILABLE = True
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
@@ -75,7 +58,6 @@ except ImportError:
 try:
     from scipy import signal
     from scipy.ndimage import binary_dilation, binary_erosion
-
     SCIPY_AVAILABLE = True
     print("✅ scipy available for advanced audio processing")
 except ImportError:
@@ -132,35 +114,35 @@ CONFIG = {
 
     # ==== ENHANCED VAD SETTINGS FOR ACCURATE SPEECH DETECTION ====
     "faster_whisper_vad_filter": True,
-    "faster_whisper_vad_threshold": 0.15,  # INCREASED: More conservative to avoid false positives
-    "faster_whisper_min_silence_duration_ms": 500,  # INCREASED: Longer silence required
-    "faster_whisper_max_speech_duration_s": 30,  # REDUCED: Shorter segments
-    "faster_whisper_min_speech_duration_ms": 100,  # INCREASED: Minimum speech length
+    "faster_whisper_vad_threshold": 0.15,
+    "faster_whisper_min_silence_duration_ms": 500,
+    "faster_whisper_max_speech_duration_s": 30,
+    "faster_whisper_min_speech_duration_ms": 100,
 
-    # ==== SPEECH DETECTION THRESHOLDS - NEW SECTION ====
-    "speech_energy_threshold": 0.008,  # Minimum energy for speech detection
-    "speech_spectral_centroid_min": 300,  # Minimum spectral centroid for speech (Hz)
-    "speech_spectral_centroid_max": 3500,  # Maximum spectral centroid for speech (Hz)
-    "speech_zero_crossing_rate_min": 0.01,  # Minimum ZCR for speech
-    "speech_zero_crossing_rate_max": 0.35,  # Maximum ZCR for speech
-    "word_confidence_threshold": 0.4,  # INCREASED: Higher confidence required
-    "segment_confidence_threshold": 0.35,  # INCREASED: Higher segment confidence
-    "enable_advanced_speech_detection": True,  # Enable spectral analysis
-    "conservative_timing_mode": True,  # Enable conservative timestamp validation
+    # ==== SPEECH DETECTION THRESHOLDS ====
+    "speech_energy_threshold": 0.008,
+    "speech_spectral_centroid_min": 300,
+    "speech_spectral_centroid_max": 3500,
+    "speech_zero_crossing_rate_min": 0.01,
+    "speech_zero_crossing_rate_max": 0.35,
+    "word_confidence_threshold": 0.4,
+    "segment_confidence_threshold": 0.35,
+    "enable_advanced_speech_detection": True,
+    "conservative_timing_mode": True,
 
-    # ==== TIMESTAMP ACCURACY SETTINGS - NEW SECTION ====
-    "timestamp_validation_enabled": True,  # Validate timestamps against audio energy
-    "timestamp_energy_window_ms": 100,  # Window size for energy analysis (ms)
-    "timestamp_buffer_start_ms": 200,  # Buffer before actual speech start (ms)
-    "timestamp_buffer_end_ms": 100,  # Buffer after actual speech end (ms)
-    "silence_gap_threshold_ms": 800,  # Minimum gap to consider separate segments
-    "merge_close_segments": True,  # Merge segments separated by short gaps
-    "max_segment_gap_ms": 400,  # Maximum gap to merge segments
+    # ==== TIMESTAMP ACCURACY SETTINGS ====
+    "timestamp_validation_enabled": True,
+    "timestamp_energy_window_ms": 100,
+    "timestamp_buffer_start_ms": 200,
+    "timestamp_buffer_end_ms": 100,
+    "silence_gap_threshold_ms": 800,
+    "merge_close_segments": True,
+    "max_segment_gap_ms": 400,
 
     # ==== NOISE FILTERING SETTINGS ====
-    "filter_background_noise": True,  # Enable background noise detection
-    "background_noise_duration_threshold": 2.0,  # Min duration to consider background noise
-    "noise_to_speech_ratio_threshold": 0.3,  # Max ratio of noise energy to speech energy
+    "filter_background_noise": True,
+    "background_noise_duration_threshold": 2.0,
+    "noise_to_speech_ratio_threshold": 0.3,
 
     # ==== JAPANESE TO ENGLISH ====
     "faster_whisper_force_language": "ja",
@@ -174,24 +156,27 @@ CONFIG = {
     "audio_dynamic_range_compression": True,
     "audio_spectral_gating": True,
 
-    # ==== MP3 TRANSCRIPTION BOOST SETTINGS - NEW ====
-    "enable_mp3_transcription_boost": True,  # Enable MP3-specific boosting
-    "mp3_boost_factor": 8.0,  # Boost factor specifically for MP3 files
-    "mp3_normalize_audio": True,  # Normalize MP3 audio before transcription
-    "mp3_target_rms": 0.15,  # Target RMS level for MP3 normalization
-    "mp3_compression_boost": True,  # Apply compression for MP3
-    "mp3_high_freq_boost": True,  # Boost high frequencies for clarity
+    # ==== MP3 TRANSCRIPTION BOOST SETTINGS ====
+    "enable_mp3_transcription_boost": True,
+    "mp3_boost_factor": 8.0,
+    "mp3_normalize_audio": True,
+    "mp3_target_rms": 0.15,
+    "mp3_compression_boost": True,
+    "mp3_high_freq_boost": True,
 
     # ==== SOFT AUDIO DETECTION THRESHOLDS ====
-    "soft_audio_rms_threshold": 0.008,  # Slightly increased for MP3
-    "soft_audio_max_threshold": 0.025,  # Slightly increased for MP3
-    "whisper_boost_factor": 15.0,  # Increased from 12.0
+    "soft_audio_rms_threshold": 0.008,
+    "soft_audio_max_threshold": 0.025,
+    "whisper_boost_factor": 15.0,
     "dynamic_compression_ratio": 4.0,
+
+    # ==== CONFIDENCE FILTERING ====
+    "enable_confidence_filtering": False,
+    "enable_text": False
 }
 
 # Global constants
-v_config = "config3.json"
-TQDM_FORMAT = "{desc}: {percentage:3.1f}% |{bar}| {n:.2f}/{total:.2f} [{elapsed}<{remaining}, {rate:.2f} audio s / real time s]"
+v_config = "config3_kotoba.json"
 
 # Garbage patterns to remove from transcriptions
 GARBAGE_PATTERNS = [
@@ -205,7 +190,7 @@ GARBAGE_PATTERNS = [
     "Mmm",
     "Ahh",
     "Uhh",
-    "♪",  # Music notes
+    "♪",
     "(music)",
     "[music]",
     "(background music)",
@@ -657,7 +642,6 @@ class AdvancedSpeechDetector:
 class WhisperTranscriber:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
-        self.pipe = None  # For HF Transformers
         self.model = None  # For faster-whisper
         self.device = None
         self.use_faster_whisper = config.get("use_faster_whisper", False)
@@ -671,10 +655,6 @@ class WhisperTranscriber:
         if self.use_faster_whisper and not FASTER_WHISPER_AVAILABLE:
             print("Error: faster-whisper requested but not installed.")
             print("Install with: pip install faster-whisper")
-            sys.exit(1)
-        elif not self.use_faster_whisper and not HF_AVAILABLE:
-            print("Error: transformers requested but not installed.")
-            print("Install with: pip install transformers")
             sys.exit(1)
 
         self._ensure_directories()
@@ -701,59 +681,25 @@ class WhisperTranscriber:
 
     def _setup_device(self):
         """Setup the best available device (MPS, CUDA, or CPU)."""
-        if self.use_faster_whisper:
-            # faster-whisper device setup
-            device_config = self.config.get("faster_whisper_device", "auto")
-            if device_config == "auto":
-                if torch.backends.mps.is_available() and self.config.get("use_mps", True):
-                    self.device = "cpu"  # faster-whisper doesn't support MPS directly, use CPU
-                    print("Using CPU for faster-whisper (MPS not supported by faster-whisper)")
-                elif torch.cuda.is_available():
-                    self.device = "cuda"
-                    print("Using CUDA for faster-whisper")
-                else:
-                    self.device = "cpu"
-                    print("Using CPU for faster-whisper")
-            else:
-                self.device = device_config
-                print(f"Using configured device for faster-whisper: {self.device}")
-        else:
-            # Regular whisper device setup
-            if self.config.get("use_mps", True) and torch.backends.mps.is_available():
-                self.device = torch.device("mps")
-                print("Using Apple Silicon MPS acceleration for Transformers Whisper")
+        # faster-whisper device setup
+        device_config = self.config.get("faster_whisper_device", "auto")
+        if device_config == "auto":
+            if torch.backends.mps.is_available() and self.config.get("use_mps", True):
+                self.device = "cpu"  # faster-whisper doesn't support MPS directly, use CPU
+                print("Using CPU for faster-whisper (MPS not supported by faster-whisper)")
             elif torch.cuda.is_available():
-                self.device = torch.device("cuda")
-                print("Using CUDA acceleration for Transformers Whisper")
+                self.device = "cuda"
+                print("Using CUDA for faster-whisper")
             else:
-                self.device = torch.device("cpu")
-                print("Using CPU for Transformers Whisper")
-
-    def _check_model_exists(self) -> bool:
-        """Check if the Whisper model is already downloaded."""
-        cache_dir = self.config["whisper_models_location"]
-        model_name = self.config["model_size"].replace("/", "--")
-
-        # Check for common cached model directory patterns
-        potential_paths = [
-            os.path.join(cache_dir, "models--" + model_name),
-            os.path.join(cache_dir, model_name),
-            os.path.join(cache_dir, self.config["model_size"]),
-        ]
-
-        for path in potential_paths:
-            if os.path.exists(path) and os.listdir(path):
-                print(f"Found cached model at: {path}")
-                return True
-
-        return False
+                self.device = "cpu"
+                print("Using CPU for faster-whisper")
+        else:
+            self.device = device_config
+            print(f"Using configured device for faster-whisper: {self.device}")
 
     def _load_model(self):
         """Load the appropriate Whisper model based on configuration."""
-        if self.use_faster_whisper:
-            self._load_faster_whisper_model()
-        else:
-            self._load_hf_model()
+        self._load_faster_whisper_model()
 
     def _get_optimal_cpu_threads(self) -> int:
         """Determine optimal number of CPU threads for faster-whisper on M4."""
@@ -783,7 +729,7 @@ class WhisperTranscriber:
                 return optimal_threads
         else:
             threads = int(cpu_threads_config)
-            print(f"Using configured {threads} threads for faster-whisper")
+            print(f"Using configured {threads} CPU threads for faster-whisper")
             return threads
 
     def _download_faster_whisper_model(self, model_size: str, local_path: str) -> str:
@@ -898,40 +844,6 @@ class WhisperTranscriber:
                     print("✅ Fallback base model loaded!")
                 except Exception as fallback_e:
                     raise RuntimeError(f"Could not load any model: {fallback_e}")
-
-    def _load_hf_model(self):
-        """Load the Hugging Face Transformers Whisper model."""
-        if self.pipe is None:
-            model_exists = self._check_model_exists()
-            if model_exists:
-                print(f"Using cached HF Whisper model: {self.config['model_size']}")
-            else:
-                print(f"Downloading HF Whisper model: {self.config['model_size']}")
-
-            cache_dir = self.config["whisper_models_location"]
-            os.makedirs(cache_dir, exist_ok=True)
-
-            try:
-                self.pipe = pipeline(
-                    "automatic-speech-recognition",
-                    model=self.config["model_size"],
-                    chunk_length_s=self.config["chunk_length_s"],
-                    device=self.device,
-                    model_kwargs={"cache_dir": cache_dir},
-                    return_timestamps=True
-                )
-                print("HF Transformers Whisper model loaded successfully!")
-            except Exception as e:
-                print(f"Error loading HF model: {e}")
-                self.pipe = pipeline(
-                    "automatic-speech-recognition",
-                    model="openai/whisper-base",
-                    chunk_length_s=self.config["chunk_length_s"],
-                    device=self.device,
-                    model_kwargs={"cache_dir": cache_dir},
-                    return_timestamps=True
-                )
-                print("Fallback HF Transformers model loaded successfully!")
 
     def _is_video_file_by_extension(self, extension: str) -> bool:
         """Check if the file extension indicates a video file."""
@@ -1848,7 +1760,8 @@ class WhisperTranscriber:
                 no_speech_threshold=0.4,
                 log_prob_threshold=-2.5,
                 compression_ratio_threshold=2.4,
-                word_timestamps=self.config.get("faster_whisper_word_timestamps",True)
+                word_timestamps=self.config.get("faster_whisper_word_timestamps", True),
+                condition_on_previous_text=self.config.get("condition_on_previous_text",True)
             )
             print(f"📊 Language: {info.language} (confidence: {info.language_probability:.2f})")
             chunks = []
@@ -1927,51 +1840,6 @@ class WhisperTranscriber:
                 "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
             }
 
-    def _transcribe_with_hf(self, audio_data: Dict[str, Any]) -> Dict[str, Any]:
-        """Transcribe using HuggingFace Transformers Whisper."""
-        if self.pipe is None:
-            raise RuntimeError("HF Transformers model is not loaded")
-
-        print("🚀 Starting HF Transformers transcription...")
-
-        try:
-            result = self.pipe(
-                audio_data["array"],
-                return_timestamps=True,
-                generate_kwargs={
-                    "task": "translate" if self.config.get("faster_whisper_task") == "translate" else "transcribe",
-                    "language": self.config.get("faster_whisper_force_language"),
-                }
-            )
-
-            # Process HF results
-            chunks = []
-            if isinstance(result.get("chunks"), list):
-                for chunk in result["chunks"]:
-                    chunks.append({
-                        "text": chunk.get("text", ""),
-                        "timestamp": chunk.get("timestamp", [0.0, 1.0])
-                    })
-            else:
-                # Fallback for non-chunked results
-                chunks = [{
-                    "text": result.get("text", ""),
-                    "timestamp": [0.0, len(audio_data["array"]) / audio_data["sampling_rate"]]
-                }]
-
-            full_text = result.get("text", "")
-            return {
-                "text": full_text,
-                "chunks": chunks
-            }
-
-        except Exception as e:
-            print(f"❌ HF Transformers error: {e}")
-            return {
-                "text": "Transcription completed with fallback.",
-                "chunks": [{"text": "Transcription completed with fallback.", "timestamp": [0.0, 10.0]}]
-            }
-
     def transcribe_file(self, file_path: str) -> str:
         """Main transcription function with enhanced speech detection for accurate timestamps."""
         actual_file_path = self._find_input_file(file_path)
@@ -1998,7 +1866,7 @@ class WhisperTranscriber:
 
             print(f"📁 Input: {audio_path}")
             print(f"📄 Output: {srt_path}")
-            print(f"🔧 Engine: {'faster-whisper' if self.use_faster_whisper else 'HF Transformers'}")
+            print(f"🔧 Engine: faster-whisper (Enhanced Speech Detection)")
             print(f"🎯 Features: Enhanced Speech Detection + Accurate Timestamps")
 
             # Load audio with enhanced preprocessing
@@ -2011,10 +1879,7 @@ class WhisperTranscriber:
             self.transcription_complete = False
 
             try:
-                if self.use_faster_whisper:
-                    result = self._transcribe_with_faster_whisper(audio_data, audio_duration)
-                else:
-                    result = self._transcribe_with_hf(audio_data)
+                result = self._transcribe_with_faster_whisper(audio_data, audio_duration)
             finally:
                 self.transcription_complete = True
                 elapsed = time.time() - start_time
@@ -2102,16 +1967,6 @@ def load_config(config_file: str = v_config) -> Dict[str, Any]:
     return config
 
 
-def save_config(config: Dict[str, Any], config_file: str = "config.json"):
-    """Save configuration to file."""
-    try:
-        with open(config_file, 'w') as f:
-            json.dump(config, f, indent=2)
-        print(f"Configuration saved to: {config_file}")
-    except IOError as e:
-        print(f"Warning: Could not save config file: {e}")
-
-
 def parse_arguments():
     """Parse command line arguments for single file or batch processing."""
     parser = argparse.ArgumentParser(
@@ -2159,7 +2014,7 @@ def main():
     config = load_config()
 
     # Show enhanced features
-    engine = "faster-whisper" if config.get("use_faster_whisper", False) else "HF Transformers"
+    engine = "faster-whisper"
     print(f"🚀 Engine: {engine} (Enhanced Speech Detection + MP3 Boost)")
     print(f"🎵 MP3 Boost: {'ENABLED' if config.get('enable_mp3_transcription_boost', True) else 'DISABLED'}")
     print(f"🎯 Advanced VAD: {'ENABLED' if config.get('faster_whisper_vad_filter', True) else 'DISABLED'}")
