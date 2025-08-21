@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """
-Whisper Transcription Tool for Mac mini - ENHANCED WITH ACCURATE TIMESTAMP DETECTION
+Whisper Transcription Tool for Mac mini - ENHANCED WITH ACCURATE TIMESTAMP DETECTION AND TRANSLATION
 Fixes issue where subtitles appear during silence/background noise
-This is with batch processing
+This is with batch processing and Japanese to English translation support for Kotoba model
 Usage: python transcribe.py [file] [--batch=y|n]
 
 KEY IMPROVEMENTS FOR ACCURATE TIMESTAMPS:
@@ -12,6 +12,7 @@ KEY IMPROVEMENTS FOR ACCURATE TIMESTAMPS:
 - Spectral analysis for speech detection
 - Word-level confidence filtering
 - Silence gap detection and removal
+- Japanese to English translation support for Kotoba model
 """
 
 import os
@@ -32,6 +33,17 @@ import time
 import warnings
 import argparse
 import glob
+import logging
+
+# NEW CODE: Import translation libraries
+try:
+    from transformers import AutoTokenizer, AutoModelForSeq2SeqLM, pipeline
+
+    TRANSFORMERS_AVAILABLE = True
+    print("✅ Transformers available for translation")
+except ImportError:
+    TRANSFORMERS_AVAILABLE = False
+    print("⚠️  Transformers not available. Install with: pip install transformers")
 
 # Suppress only the specific numpy warnings that don't affect functionality
 warnings.filterwarnings("ignore", message="divide by zero encountered in matmul")
@@ -41,6 +53,7 @@ warnings.filterwarnings("ignore", message="invalid value encountered in matmul")
 # Try to import psutil for CPU detection
 try:
     import psutil
+
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
@@ -49,6 +62,7 @@ except ImportError:
 # Try to import faster-whisper
 try:
     from faster_whisper import WhisperModel
+
     FASTER_WHISPER_AVAILABLE = True
 except ImportError:
     FASTER_WHISPER_AVAILABLE = False
@@ -58,6 +72,7 @@ except ImportError:
 try:
     from scipy import signal
     from scipy.ndimage import binary_dilation, binary_erosion
+
     SCIPY_AVAILABLE = True
     print("✅ scipy available for advanced audio processing")
 except ImportError:
@@ -69,7 +84,7 @@ CONFIG = {
     "temp_location": "/Volumes/Macintosh HD/Downloads/srt/temp",
     "audio_source": "/Volumes/Macintosh HD/Downloads",
     "video_source": "/Volumes/Macintosh HD/Downloads/Video/uc",
-    "audio_export": "/Volumes/Macintosh HD/Downloads/audio/exported",
+    "audio_export": "/Volumes/Macintosh HD/Downloads/srt/audio/exported",
     "whisper_models_location": "/Volumes/Macintosh HD/Downloads/srt/whisper_models",
     "ffmpeg_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
     "ffprobe_path": "/Volumes/250SSD/Library/Application Support/audacity/libs",
@@ -149,6 +164,11 @@ CONFIG = {
     "faster_whisper_initial_prompt": None,
     "faster_whisper_task": "translate",
 
+    # NEW CODE: Translation settings
+    "translation_enabled": False,
+    "translation_model": "Helsinki-NLP/opus-mt-ja-en",
+    "translation_models_location": "/Volumes/Macintosh HD/Downloads/srt/kotoba/models/models--Helsinki-NLP--opus-mt-ja-en",
+
     # ==== AUDIO PROCESSING ====
     "audio_minimal_preprocessing": False,
     "audio_keep_original_format": True,
@@ -176,7 +196,101 @@ CONFIG = {
 }
 
 # Global constants
-v_config = "config3_kotoba.json"
+#use kotoba model
+#v_config = "config3_kotoba.json"
+#use faster-whisper model
+v_config = "config3.json"
+
+
+# NEW CODE: Translation class
+class TranslationProcessor:
+    """Handles Japanese to English translation using Hugging Face Transformers."""
+
+    def __init__(self, config: Dict[str, Any]):
+        self.config = config
+        self.translator = None
+        self.translation_enabled = config.get("translation_enabled", False)
+        self.translation_model = config.get("translation_model", "Helsinki-NLP/opus-mt-ja-en")
+        self.models_location = Path(config.get("translation_models_location", "/tmp/translation_models"))
+
+        # Setup logging for translation
+        self.logger = logging.getLogger(__name__)
+
+        if self.translation_enabled and TRANSFORMERS_AVAILABLE:
+            self._load_translation_model()
+
+    def _load_translation_model(self):
+        """Load the translation model from local path or download it."""
+        if not TRANSFORMERS_AVAILABLE:
+            self.logger.error("Transformers library not available. Translation disabled.")
+            self.translation_enabled = False
+            return
+
+        try:
+            self.models_location.mkdir(parents=True, exist_ok=True)
+            self.logger.info(f"Loading translation model '{self.translation_model}' from: {self.models_location}")
+            print(f"🔄 Loading translation model: {self.translation_model}")
+
+            tokenizer = AutoTokenizer.from_pretrained(
+                self.translation_model,
+                cache_dir=str(self.models_location)
+            )
+            model = AutoModelForSeq2SeqLM.from_pretrained(
+                self.translation_model,
+                cache_dir=str(self.models_location)
+            )
+
+            self.translator = pipeline(
+                "translation_ja_to_en",
+                model=model,
+                tokenizer=tokenizer
+            )
+
+            self.logger.info(f"Successfully loaded {self.translation_model}")
+            print(f"✅ Translation model loaded successfully!")
+
+        except Exception as e:
+            self.logger.error(f"Failed to load translation model '{self.translation_model}': {e}")
+            print(f"❌ Translation model loading failed: {e}")
+            print("💡 Solutions:")
+            print("   1. Install transformers: pip install transformers")
+            print("   2. Check internet connection for model download")
+            print("   3. Set translation_enabled to false in config")
+            self.translation_enabled = False
+
+    def translate_text(self, text: str) -> str:
+        """
+        Translate Japanese text to English using the loaded model.
+
+        Args:
+            text (str): The Japanese text to translate.
+
+        Returns:
+            str: The translated English text, or original text if translation fails.
+        """
+        if not self.translation_enabled or not self.translator:
+            return text
+
+        if not text or not text.strip():
+            return text
+
+        try:
+            self.logger.info("Starting translation...")
+            print(f"   🔄 Translating: {text[:50]}...")
+
+            result = self.translator(text)
+            translated_text = result[0]['translation_text']
+
+            self.logger.info("Translation completed.")
+            print(f"   ✅ Translated: {translated_text[:50]}...")
+
+            return translated_text.strip()
+
+        except Exception as e:
+            self.logger.error(f"Translation failed: {e}")
+            print(f"   ❌ Translation failed: {e}")
+            return text  # Return original text if translation fails
+
 
 # Garbage patterns to remove from transcriptions
 GARBAGE_PATTERNS = [
@@ -651,6 +765,9 @@ class WhisperTranscriber:
         # Initialize advanced speech detector
         self.speech_detector = AdvancedSpeechDetector(config)
 
+        # NEW CODE: Initialize translation processor
+        self.translation_processor = TranslationProcessor(config)
+
         # Validate that the required library is available
         if self.use_faster_whisper and not FASTER_WHISPER_AVAILABLE:
             print("Error: faster-whisper requested but not installed.")
@@ -674,7 +791,10 @@ class WhisperTranscriber:
             self.config["audio_source"],
             self.config["video_source"],
             self.config["audio_export"],
-            self.config["whisper_models_location"]
+            self.config["whisper_models_location"],
+            # NEW CODE: Add translation models directory
+            #self.config.get("translation_models_location", "/tmp/translation_models")
+            self.config["translation_models_location"],
         ]
         for path in directories:
             Path(path).mkdir(parents=True, exist_ok=True)
@@ -1610,9 +1730,10 @@ class WhisperTranscriber:
         print(f"🔪 Split long segment ({duration:.1f}s) into {len(chunks)} chunks")
         return chunks
 
+    # NEW CODE: Modified method to include translation
     def _clean_srt_segments(self, segments: List[srt.Subtitle], audio_data: np.ndarray,
                             sample_rate: int) -> List[srt.Subtitle]:
-        """Clean and filter SRT segments with advanced speech detection and overlap prevention."""
+        """Clean and filter SRT segments with advanced speech detection, overlap prevention, and translation."""
         print("🧹 Cleaning SRT segments with advanced speech detection...")
 
         cleaned_segments = []
@@ -1635,6 +1756,23 @@ class WhisperTranscriber:
             if prompt_text.strip() and prompt_text.lower() in text.lower():
                 print(f"⚠️ Skipped prompt-like SRT segment: '{text[:50]}...'")
                 continue
+
+            # NEW CODE: Apply translation if enabled and using Kotoba model
+            # Check if we're using Kotoba model (based on model path or name)
+            is_kotoba = (
+                    "kotoba" in self.config.get("faster_whisper_model_size", "").lower() or
+                    "kotoba" in str(self.config.get("faster_whisper_local_model_path", "")).lower()
+            )
+
+            if is_kotoba and self.translation_processor.translation_enabled:
+                original_text = text
+                translated_text = self.translation_processor.translate_text(text)
+                if translated_text != original_text:
+                    text = translated_text
+                    print(f"   🌐 Translated segment: '{original_text[:30]}...' -> '{text[:30]}...'")
+
+            # Update segment content with translated text (if translation occurred)
+            segment.content = text
 
             # Check segment duration and split if needed
             duration = (segment.end - segment.start).total_seconds()
@@ -1761,7 +1899,7 @@ class WhisperTranscriber:
                 log_prob_threshold=-2.5,
                 compression_ratio_threshold=2.4,
                 word_timestamps=self.config.get("faster_whisper_word_timestamps", True),
-                condition_on_previous_text=self.config.get("condition_on_previous_text",True)
+                condition_on_previous_text=self.config.get("condition_on_previous_text", True)
             )
             print(f"📊 Language: {info.language} (confidence: {info.language_probability:.2f})")
             chunks = []
@@ -1790,7 +1928,8 @@ class WhisperTranscriber:
                     avg_confidence = np.mean([w.probability for w in high_conf_words])
                     if avg_confidence < segment_confidence_threshold:
                         if enable_text:
-                            print(f"   ❌ Filtered low-confidence segment: '{text[:30]}...' (conf: {avg_confidence:.2f})")
+                            print(
+                                f"   ❌ Filtered low-confidence segment: '{text[:30]}...' (conf: {avg_confidence:.2f})")
 
                         filtered_count += 1
                         continue
@@ -1867,7 +2006,19 @@ class WhisperTranscriber:
             print(f"📁 Input: {audio_path}")
             print(f"📄 Output: {srt_path}")
             print(f"🔧 Engine: faster-whisper (Enhanced Speech Detection)")
-            print(f"🎯 Features: Enhanced Speech Detection + Accurate Timestamps")
+
+            # NEW CODE: Show translation status
+            is_kotoba = (
+                    "kotoba" in self.config.get("faster_whisper_model_size", "").lower() or
+                    "kotoba" in str(self.config.get("faster_whisper_local_model_path", "")).lower()
+            )
+
+            if is_kotoba and self.translation_processor.translation_enabled:
+                print(f"🌐 Translation: ENABLED ({self.translation_processor.translation_model})")
+            else:
+                print(f"🌐 Translation: DISABLED")
+
+            print(f"🎯 Features: Enhanced Speech Detection + Accurate Timestamps + Translation")
 
             # Load audio with enhanced preprocessing
             audio_data = self._load_audio(audio_path)
@@ -1911,7 +2062,7 @@ class WhisperTranscriber:
                     content="No speech detected in audio."
                 )]
 
-            # Enhanced cleaning with speech detection
+            # Enhanced cleaning with speech detection and translation
             cleaned_subs = self._clean_srt_segments(subs, audio_data["array"], audio_data["sampling_rate"])
             if not cleaned_subs:
                 # Fallback if all segments were filtered
@@ -1932,6 +2083,10 @@ class WhisperTranscriber:
 
             print(f"✅ Success! Enhanced SRT saved with {len(cleaned_subs)} accurate segments")
             print(f"🎯 Features used: Advanced VAD, Speech Detection, Timestamp Validation")
+
+            # NEW CODE: Show translation status in completion message
+            if is_kotoba and self.translation_processor.translation_enabled:
+                print(f"🌐 Translation: Japanese -> English ({self.translation_processor.translation_model})")
 
             if not temp_audio:
                 print(f"📁 Audio saved: {audio_path}")
@@ -1970,7 +2125,7 @@ def load_config(config_file: str = v_config) -> Dict[str, Any]:
 def parse_arguments():
     """Parse command line arguments for single file or batch processing."""
     parser = argparse.ArgumentParser(
-        description="Enhanced Whisper Transcription Tool with Batch Processing",
+        description="Enhanced Whisper Transcription Tool with Batch Processing and Translation",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
@@ -1985,6 +2140,7 @@ Enhanced Features:
   🔗 Smart segment merging
   ✂️  Automatic silence removal
   🎵 MP3 audio boosting for better transcription
+  🌐 Japanese to English translation (Kotoba models)
         """
     )
 
@@ -2015,12 +2171,21 @@ def main():
 
     # Show enhanced features
     engine = "faster-whisper"
-    print(f"🚀 Engine: {engine} (Enhanced Speech Detection + MP3 Boost)")
+    print(f"🚀 Engine: {engine} (Enhanced Speech Detection + MP3 Boost + Translation)")
     print(f"🎵 MP3 Boost: {'ENABLED' if config.get('enable_mp3_transcription_boost', True) else 'DISABLED'}")
     print(f"🎯 Advanced VAD: {'ENABLED' if config.get('faster_whisper_vad_filter', True) else 'DISABLED'}")
     print(f"🔍 Speech Analysis: {'ENABLED' if config.get('enable_advanced_speech_detection', True) else 'DISABLED'}")
     print(f"⏱️  Timestamp Validation: {'ENABLED' if config.get('timestamp_validation_enabled', True) else 'DISABLED'}")
     print(f"🚫 Noise Filtering: {'ENABLED' if config.get('filter_background_noise', True) else 'DISABLED'}")
+
+    # NEW CODE: Show translation configuration
+    translation_enabled = config.get("translation_enabled", False)
+    translation_model = config.get("translation_model", "Helsinki-NLP/opus-mt-ja-en")
+    print(f"🌐 Translation: {'ENABLED' if translation_enabled and TRANSFORMERS_AVAILABLE else 'DISABLED'}")
+    if translation_enabled and TRANSFORMERS_AVAILABLE:
+        print(f"   📚 Model: {translation_model}")
+    elif translation_enabled and not TRANSFORMERS_AVAILABLE:
+        print(f"   ⚠️  Transformers library required: pip install transformers")
 
     # Initialize transcriber
     transcriber = WhisperTranscriber(config)
@@ -2078,6 +2243,10 @@ def main():
             print("   🎯 Accurate speech detection and timestamps")
             print("   🚫 Background noise and silence filtering")
 
+            # NEW CODE: Show translation info if applicable
+            if translation_enabled and TRANSFORMERS_AVAILABLE:
+                print("   🌐 Japanese to English translation (when using Kotoba models)")
+
     except KeyboardInterrupt:
         print("\n⏹️  Processing interrupted by user")
         sys.exit(0)
@@ -2085,6 +2254,11 @@ def main():
         print(f"\n❌ Error: {e}")
         print("\n🔧 Troubleshooting:")
         print("   • Install scipy for advanced features: pip install scipy")
+
+        # NEW CODE: Add translation troubleshooting
+        if config.get("translation_enabled", False) and not TRANSFORMERS_AVAILABLE:
+            print("   • Install transformers for translation: pip install transformers")
+
         print("   • Check audio quality and volume levels")
         print("   • Try adjusting VAD threshold in config")
         print("   • Enable conservative_timing_mode in config")
